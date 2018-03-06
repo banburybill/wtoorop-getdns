@@ -50,6 +50,7 @@
 #endif
 #include "rr-iter.h"
 #include "anchor.h"
+#include "upstreams.h"
 
 struct getdns_dns_req;
 struct ub_ctx;
