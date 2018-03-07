@@ -27,4 +27,82 @@
 
 #include "config.h"
 #include "upstreams.h"
+#include "context.h"
+
+void
+_getdns_upstreams_init(_getdns_upstreams *upstreams, getdns_context *context)
+{
+	assert(upstreams);
+	(void) memset(upstreams, 0, sizeof(_getdns_upstreams));
+	upstreams->super.r.context = context;
+}
+
+getdns_context *
+_getdns_upstream_get_context(_getdns_upstream *upstream)
+{
+	assert(upstream);
+	while (upstream->parent)
+		upstream = upstream->parent;
+	return ((_getdns_upstreams *)upstream)->super.r.context;
+}
+
+static _getdns_upstream *
+_simple_next_upstream(_getdns_upstream *current)
+{
+	if (!current || !current->next)
+		return NULL;
+	if (current->children)
+		return current->children;
+	for (;;) {
+		if (!current->parent)
+			return current->next;
+		if (current->next != current->parent->children)
+			return current->next;
+		current = current->parent;
+	};
+}
+
+_getdns_upstream *
+_getdns_next_upstream(_getdns_upstream *current,
+    upstream_caps cap, _getdns_upstream *stop_at)
+{
+	_getdns_upstream *start = current;
+
+	for ( current = _simple_next_upstream(current)
+	    ; current && current != start && current != stop_at
+	    ; current = _simple_next_upstream(current))
+		if (_upstream_cap_complies(cap, current->may))
+			return current;
+	return NULL;
+}
+
+_getdns_upstream *upstream_iter_init(upstream_iter *iter,
+    _getdns_upstreams *upstreams, upstream_caps cap)
+{
+	if (!iter) return NULL;
+	iter->cap = cap;
+	iter->stop_at = NULL;
+	if (!(iter->current = upstreams->current[cap & 7])) {
+		_getdns_upstream *current = upstreams->super.r.children;
+
+		if (!current
+		|| (!_upstream_cap_complies((cap & 7), current->may)
+		   && !(current = _getdns_next_upstream( current
+		                                       , cap & 7, NULL))))
+			return NULL;
+		iter->current = upstreams->current[cap & 7] = current;
+	}
+	if (_upstream_cap_complies(cap, iter->current->may))
+		return (iter->stop_at = iter->current);
+
+	return (iter->stop_at = iter->current =
+	    _getdns_next_upstream(iter->current, cap, NULL));
+}
+
+_getdns_upstream *upstream_iter_next(upstream_iter *iter)
+{
+	if (!iter) return NULL;
+	return (iter->current =
+	    _getdns_next_upstream(iter->current, iter->cap, iter->stop_at));
+}
 
