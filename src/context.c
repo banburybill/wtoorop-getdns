@@ -1176,6 +1176,10 @@ set_os_defaults_windows(getdns_context *context)
     int s;
 	uint32_t info_err = 0;
 
+	// GUPS {
+	_getdns_upstreams_cleanup(&context->gups);
+	// } GUPS
+
     if (!(context->upstreams = upstreams_create(context, upstreams_limit)))
 	    return GETDNS_RETURN_MEMORY_ERROR;
 
@@ -1209,6 +1213,12 @@ set_os_defaults_windows(getdns_context *context)
 		*domain = 0;
 		while (ptr) {
 			size_t i;
+
+			// GUPS {
+			(void) _getdns_append_address_str_upstream(
+			    &context->gups.super.u, ptr->IpAddress.String, NULL);
+			// } GUPS
+
 			for (i = 0; i < GETDNS_UPSTREAM_TRANSPORTS; i++) {
 				char *port_str = getdns_port_str_array[i];
 				if ((s = getaddrinfo(ptr->IpAddress.String, port_str, &hints, &result)))
@@ -1280,6 +1290,10 @@ getdns_context_set_resolvconf(getdns_context *context, const char *resolvconf)
 			upstream_count++;
 	fclose(in);
 
+	// GUPS {
+	_getdns_upstreams_cleanup(&context->gups);
+	// } GUPS
+
 	suffix = getdns_list_create_with_context(context);
 	if (context->upstreams) {
 		_getdns_upstreams_dereference(context->upstreams);
@@ -1343,6 +1357,11 @@ getdns_context_set_resolvconf(getdns_context *context, const char *resolvconf)
 		if (*parse == 0 || *parse == '#') continue;
 		token = parse + strcspn(parse, " \t\r\n");
 		*token = 0;
+
+		// GUPS {
+		(void) _getdns_append_address_str_upstream(
+		    &context->gups.u.u, parse, NULL);
+		// } GUPS
 
 		for (i = 0; i < GETDNS_UPSTREAM_TRANSPORTS; i++) {
 			char *port_str = getdns_port_str_array[i];
@@ -1616,6 +1635,7 @@ getdns_context_create_with_extended_memory_functions(
 		result->trust_anchors_source = GETDNS_TASRC_ZONE;
 	}
 
+	_getdns_upstreams_init(&result->gups, result);
 	result->upstreams = NULL;
 
 	result->edns_extended_rcode = 0;
@@ -2876,16 +2896,21 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 	getdns_upstreams *upstreams;
 	char addrstr[1024], portstr[1024], *eos;
 	struct addrinfo hints;
+	_getdns_upstreams gups;
 
 	RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
 
 	if (  !upstream_list
 	   || (r = getdns_list_get_length(upstream_list, &count))
 	   || count == 0) {
+		// GUPS {
+		_getdns_upstreams_cleanup(&context->gups);
+		// } GUPS
 		_getdns_upstreams_dereference(context->upstreams);
 		context->upstreams = NULL;
 		dispatch_updated(context,
 			GETDNS_CONTEXT_CODE_UPSTREAM_RECURSIVE_SERVERS);
+		return GETDNS_RETURN_GOOD;
 	}
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family    = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
@@ -2896,6 +2921,9 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 	hints.ai_addr      = NULL;
 	hints.ai_next      = NULL;
 
+	// GUPS {
+	_getdns_upstreams_init(&gups, context);
+	// } GUPS
 	upstreams = upstreams_create(
 	    context, count * GETDNS_UPSTREAM_TRANSPORTS);
 	for (i = 0; i < count; i++) {
@@ -2904,9 +2932,14 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 		getdns_bindata *address_data;
 		getdns_bindata *tls_auth_name;
 		struct sockaddr_storage  addr;
+		uint32_t port;
 
 		getdns_bindata  *scope_id;
 		getdns_upstream *upstream;
+
+		// GUPS {
+		_getdns_upstream *gup;
+		// } GUPS
 
 		getdns_bindata  *tsig_alg_name, *tsig_name, *tsig_key;
 		getdns_tsig_algo tsig_alg;
@@ -3035,10 +3068,17 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 		/* Don't check TSIG length contraints here.
 		 * Let the upstream decide what is secure enough.
 		 */
+		// GUPS {
+		if (_getdns_append_address_str_upstream(&gups.u.u, addrstr, &gup))
+			goto invalid_parameter;
+		if (dict && !getdns_dict_get_int(dict, "port", &port))
+			gup->vmt->set_port(gup, port);
+		if (dict && !getdns_dict_get_int(dict, "tls_port", &port))
+			gup->vmt->set_tls_port(gup, port);
+		// } GUPS
 
 		/* Loop to create upstreams as needed*/
 		for (j = 0; j < GETDNS_UPSTREAM_TRANSPORTS; j++) {
-			uint32_t port;
 			struct addrinfo *ai;
 			port = getdns_port_array[j];
 			if (port == GETDNS_PORT_ZERO)
@@ -3147,6 +3187,10 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 	}
 	_getdns_upstreams_dereference(context->upstreams);
 	context->upstreams = upstreams;
+	// GUPS {
+	_getdns_upstreams_cleanup(&context->gups);
+	_getdns_context_set_upstreams(context, &gups);
+	// } GUPS
 	dispatch_updated(context,
 		GETDNS_CONTEXT_CODE_UPSTREAM_RECURSIVE_SERVERS);
 
@@ -4304,7 +4348,7 @@ error:
 struct mem_funcs *
 priv_getdns_context_mf(getdns_context *context)
 {
-	return &context->mf;
+	return context ? &context->mf : NULL;
 }
 
 /** begin getters **/
@@ -4574,6 +4618,10 @@ getdns_context_get_upstream_recursive_servers(getdns_context *context,
 	if (!context || !upstreams_r)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
+	// GUPS {
+	return _getdns_upstreams2list(&context->gups, upstreams_r);
+	// } GUPS
+		
 	if (!(upstreams = getdns_list_create_with_context(context)))
 		return GETDNS_RETURN_MEMORY_ERROR;
 
