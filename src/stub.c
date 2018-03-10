@@ -2440,6 +2440,7 @@ upstream_schedule_netreq(getdns_upstream *upstream, getdns_network_req *netreq)
 	}
 }
 
+#if 0
 getdns_return_t
 _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 {
@@ -2556,5 +2557,6 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 		return GETDNS_RETURN_GENERIC_ERROR;
 	}
 }
+#endif
 
 /* stub.c */

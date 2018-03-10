@@ -30,6 +30,8 @@
 #include "context.h"
 #include "util-internal.h"
 #include "platform.h"
+#include "debug.h"
+#include "general.h"
 
 #ifndef USE_WINSOCK
 #include <netdb.h>
@@ -38,29 +40,29 @@
 typedef unsigned short in_port_t;
 #endif
 
+
+#define STUB_TRY_AGAIN_LATER -24 /* EMFILE, i.e. Out of OS resources */
+
+
+/* Virtual Method Tables (initialized at end of file) */
+
+static _getdns_upstream_vmt      _base_vmt;
+static _getdns_upstream_vmt   _address_vmt;
+static _getdns_upstream_vmt       _udp_vmt;
+static _getdns_upstream_vmt       _tcp_vmt;
+static _getdns_upstream_vmt       _tls_vmt;
+
 /* Functions for _getdns_upstreams 
  *****************************************************************************/
-static void _upstream_nop(_getdns_upstream *self)
-{ (void)self; }
-static void _upstream_nop_uint32_t(_getdns_upstream *self, uint32_t n)
-{ (void)self; (void)n; }
-static getdns_return_t _upstream_nop_as_dict(_getdns_upstream *self, getdns_dict **dict_r)
-{ (void)self; (void)dict_r; return GETDNS_RETURN_NOT_IMPLEMENTED; }
-
-static _getdns_upstream_vmt _nop_upstream_vmt = {
-	_upstream_nop,
-	_upstream_nop_uint32_t,
-	_upstream_nop_uint32_t,
-	_upstream_nop_as_dict
-};
 
 void
 _getdns_upstreams_init(_getdns_upstreams *upstreams, getdns_context *context)
 {
 	assert(upstreams);
 	(void) memset(upstreams, 0, sizeof(_getdns_upstreams));
-	upstreams->u.r.context = context;
-	upstreams->u.u.vmt = &_nop_upstream_vmt;
+	upstreams->context = context;
+	upstreams->super.next = &upstreams->super;
+	upstreams->super.vmt  = &_base_vmt;
 }
 
 void
@@ -76,10 +78,10 @@ _getdns_context_set_upstreams(getdns_context *context, _getdns_upstreams *upstre
 	 * Individual upstreams are responsible for cleaning up their
 	 * children themselfs.
 	 */
-	if (!(start = current = context->gups.u.r.children))
-		; /* pass */
+	if (!(start = current = context->gups.super.children))
+		; /* No children, pass */
 	else do {
-		current->parent = &context->gups.u.u;
+		current->parent = &context->gups.super;
 		current = current->next;
 	} while (current && current != start);
 }
@@ -95,14 +97,14 @@ _getdns_upstreams_cleanup(_getdns_upstreams *upstreams)
 	 * Individual upstreams are responsible for cleaning up their
 	 * children themselfs.
 	 */
-	if (!(start = current = upstreams->u.r.children))
+	if (!(start = current = upstreams->super.children))
 		; /* pass */
 	else do {
 		current->vmt->cleanup(current);
 		current = current->next;
 	} while (current && current != start);
 
-	upstreams->u.r.children = NULL;
+	upstreams->super.children = NULL;
 }
 
 getdns_return_t
@@ -115,7 +117,7 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 
 	assert(upstreams);
 
-	if (!(start = current = upstreams->u.r.children))
+	if (!(start = current = upstreams->super.children))
 		; /* pass */
 	else do {
 		if ((r = current->vmt->as_dict(current, &dict))) {
@@ -123,7 +125,7 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 			return r;
 		}
 		if (!list
-		&& !(list = getdns_list_create_with_context(upstreams->u.r.context)))
+		&& !(list = getdns_list_create_with_context(upstreams->context)))
 			return GETDNS_RETURN_MEMORY_ERROR;
 
 		if ((r = _getdns_list_append_this_dict(list, dict))) {
@@ -134,7 +136,7 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 	} while (current && current != start);
 
 	if (!list
-	&& !(list = getdns_list_create_with_context(upstreams->u.r.context)))
+	&& !(list = getdns_list_create_with_context(upstreams->context)))
 		return GETDNS_RETURN_MEMORY_ERROR;
 	*list_r = list;
 	return GETDNS_RETURN_GOOD;
@@ -151,7 +153,7 @@ _getdns_upstream_get_context(_getdns_upstream *upstream)
 		return NULL;
 	while (upstream->parent)
 		upstream = upstream->parent;
-	return ((_getdns_upstreams *)upstream)->u.r.context;
+	return ((_getdns_upstreams *)upstream)->context;
 }
 
 static _getdns_upstream *
@@ -215,16 +217,21 @@ _getdns_upstream *upstream_iter_init(upstream_iter *iter,
 	if (!iter) return NULL;
 	iter->cap = cap;
 	iter->stop_at = NULL;
-	if (!(iter->current = upstreams->current[cap & 7])) {
-		_getdns_upstream *current = upstreams->u.r.children;
+	if (!(iter->current = upstreams->current[cap & CAP_TRANS])) {
+		_getdns_upstream *current = upstreams->super.children;
 
 		if (!current
-		|| (!_upstream_cap_complies((cap & 7), current->may)
-		   && !(current = _getdns_next_upstream( current
-		                                       , cap & 7, NULL))))
+		|| (!_upstream_cap_complies((cap & CAP_TRANS), current->may)
+		   && !(current = _getdns_next_upstream(
+				   current, (cap & CAP_TRANS), NULL))))
 			return NULL;
-		iter->current = upstreams->current[cap & 7] = current;
+		iter->current = upstreams->current[cap & CAP_TRANS] = current;
 	}
+	if (upstreams->context->round_robin_upstreams)
+		upstreams->current[cap & CAP_TRANS]  =
+		    _getdns_next_upstream(upstreams->current[cap & CAP_TRANS],
+				    (cap & CAP_TRANS), NULL);
+
 	if (_upstream_cap_complies(cap, iter->current->may))
 		return (iter->stop_at = iter->current);
 
@@ -239,30 +246,54 @@ _getdns_upstream *upstream_iter_next(upstream_iter *iter)
 	    _getdns_next_upstream(iter->current, iter->cap, iter->stop_at));
 }
 
+/* netreq_next_upstream on first use returns the first upstream to use
+ * on successive calls the next upstream to try is returned, untill
+ * everything has been tried, then NULL is returned.
+ */
+static _getdns_upstream *netreq_next_upstream(getdns_network_req *netreq)
+{
+	_getdns_upstream *up;
+
+	if (!netreq)
+		return NULL;
+
+	if (netreq->gup.current) {
+		if ((up = upstream_iter_next(&netreq->gup)))
+			return up;
+
+		/* Try next transport */
+		netreq->transport_current += 1;
+	}
+	while (netreq->transport_current < netreq->transport_count) {
+		upstream_caps cap;
+
+		switch (netreq->transports[netreq->transport_current]) {
+		case GETDNS_TRANSPORT_UDP: cap = CAP_STATELESS | CAP_UNENCRYPTED;
+		                           break;
+		case GETDNS_TRANSPORT_TCP: cap = CAP_STATEFUL | CAP_UNENCRYPTED;
+		                           break;
+		case GETDNS_TRANSPORT_TLS: cap = CAP_STATEFUL | CAP_ENCRYPTED;
+		                           if (netreq->tls_auth_min ==
+		                               GETDNS_AUTHENTICATION_REQUIRED)
+		                           	cap |= CAP_AUTHENTICATED;
+		                           break;
+		default                  : cap = 0;
+		                           break;
+		}
+
+		if ((up = upstream_iter_init(
+		    &netreq->gup, &netreq->owner->context->gups, cap)))
+			return up;
+
+		/* Try next transport */
+		netreq->transport_current += 1;
+	}
+	return NULL;
+}
+
 
 /* Address based upstreams
  *****************************************************************************/
-
-static void _set_parent_port(_getdns_upstream *self, uint32_t port)
-{
-	assert(self);
-	if (self->parent)
-		self->parent->vmt->set_port(self->parent, port);
-}
-
-static void _set_parent_tls_port(_getdns_upstream *self, uint32_t port)
-{
-	assert(self);
-	if (self->parent)
-		self->parent->vmt->set_tls_port(self->parent, port);
-}
-
-static _getdns_upstream_vmt _default_upstream_vmt = {
-	_upstream_nop,
-	_set_parent_port,
-	_set_parent_tls_port,
-	_upstream_nop_as_dict
-};
 
 typedef struct _edns_cookie_st {
 	uint32_t secret;
@@ -285,15 +316,21 @@ typedef struct _stateless_upstream {
 	size_t           n_timeouts;
 } _stateless_upstream;
 
-
 static void
 _stateless_upstream_init(_stateless_upstream *up)
 {
 	assert(up);
-	up->super.vmt = &_default_upstream_vmt;
-	up->super.may = CAP_MIGHT;
+	up->super.vmt = &_base_vmt;
+	up->super.may = CAP_MIGHT | CAP_STATELESS | CAP_UNENCRYPTED;
 	up->to_retry = 1;
 	up->back_off = 1;
+}
+static void
+_udp_upstream_init(_stateless_upstream *up)
+{
+	assert(up);
+	_stateless_upstream_init(up);
+	up->super.vmt = &_udp_vmt;
 }
 
 /*
@@ -361,13 +398,21 @@ static void
 _stateful_upstream_init(_stateful_upstream *up)
 {
 	assert(up);
-	up->super.vmt = &_default_upstream_vmt;
-	up->super.may = (CAP_MIGHT | CAP_STATEFUL);
+	up->super.vmt = &_base_vmt;
+	up->super.may = CAP_MIGHT | CAP_STATEFUL | CAP_UNENCRYPTED;
 	up->fd = -1;
 	up->conn_backoff_interval = 1;
 	(void) getdns_eventloop_event_init(&up->event, up, NULL, NULL, NULL);
 	(void) getdns_eventloop_event_init(
 	    &up->finished_event, up, NULL, NULL, NULL);
+}
+
+static void
+_tcp_upstream_init(_stateful_upstream *up)
+{
+	assert(up);
+	_stateful_upstream_init(up);
+	up->super.vmt = &_tcp_vmt;
 }
 
 typedef struct _tls_upstream {
@@ -394,7 +439,8 @@ static void
 _tls_upstream_init(_tls_upstream *up)
 {
 	_stateful_upstream_init(&up->super);
-	up->super.super.may |= CAP_ENCRYPTED;
+	up->super.super.vmt = &_tls_vmt;
+	up->super.super.may = CAP_MIGHT | CAP_STATEFUL | CAP_ENCRYPTED;
 
 	up->tls_port = 853;
 	up->tls_hs_state = GETDNS_HS_NONE;
@@ -426,7 +472,7 @@ typedef struct _address_upstream {
 	_tsig_st                 tsig;
 } _address_upstream;
 
-static void _address_upstream_cleanup(_getdns_upstream *to_cast)
+static void _address_cleanup(_getdns_upstream *to_cast)
 {
 	struct mem_funcs  *mfs;
 	_address_upstream *self = (_address_upstream *)to_cast;
@@ -441,7 +487,7 @@ static void _address_upstream_cleanup(_getdns_upstream *to_cast)
 	GETDNS_FREE(*mfs, self);
 }
 
-static void _address_upstream_set_port(_getdns_upstream *to_cast, uint32_t port)
+static void _address_set_port(_getdns_upstream *to_cast, uint32_t port)
 {
 	_address_upstream *self = (_address_upstream *)to_cast;
 	assert(self);
@@ -453,7 +499,7 @@ static void _address_upstream_set_port(_getdns_upstream *to_cast, uint32_t port)
 		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
 }
 
-static void _address_upstream_set_tls_port(_getdns_upstream *to_cast, uint32_t port)
+static void _address_set_tls_port(_getdns_upstream *to_cast, uint32_t port)
 {
 	_address_upstream *self = (_address_upstream *)to_cast;
 	assert(self);
@@ -461,7 +507,7 @@ static void _address_upstream_set_tls_port(_getdns_upstream *to_cast, uint32_t p
 	self->tls.tls_port = port;
 }
 
-static getdns_return_t _address_upstream_as_dict(
+static getdns_return_t _address_as_dict(
     _getdns_upstream *to_cast, getdns_dict **dict_r)
 {
 	_address_upstream *self = (_address_upstream *)to_cast;
@@ -532,13 +578,6 @@ static getdns_return_t _address_upstream_as_dict(
 	return GETDNS_RETURN_GOOD;
 }
 
-static _getdns_upstream_vmt _address_upstream_vmt = {
-	_address_upstream_cleanup,
-	_address_upstream_set_port,
-	_address_upstream_set_tls_port,
-	_address_upstream_as_dict
-};
-
 getdns_return_t
 _getdns_append_address_str_upstream(_getdns_upstream *parent,
     const char *addr_str, _getdns_upstream **new_upstream)
@@ -561,7 +600,7 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 	(void) memset(up, 0, sizeof(*up));
 	up->super.parent             = parent;
 	up->super.children           = &up->udp.super;
-	up->super.vmt                = &_address_upstream_vmt;
+	up->super.vmt                = &_address_vmt;
 
 	up->udp.super.parent         = &up->super;
 	up->udp.super.children       = NULL;
@@ -575,8 +614,8 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 	up->tls.super.super.children = NULL;
 	up->tls.super.super.next     = &up->udp.super;
 
-	_stateless_upstream_init(&up->udp);
-	_stateful_upstream_init(&up->tcp);
+	_udp_upstream_init(&up->udp);
+	_tcp_upstream_init(&up->tcp);
 	_tls_upstream_init(&up->tls);
 
 	(void) strlcpy(up->addr_str, addr_str, sizeof(up->addr_str));
@@ -608,4 +647,121 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 		*new_upstream = &up->super;
 	return GETDNS_RETURN_GOOD;
 }
+
+getdns_return_t
+_getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
+{
+	_getdns_upstream *up;
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+	           (void*)netreq, netreq->request_type);
+
+	assert(netreq);
+
+	/* Find upstream for current transport */
+	while ((up = netreq_next_upstream(netreq))) {
+		switch (up->vmt->submit(up, netreq, now_ms)) {
+		case GETDNS_RETURN_GOOD:
+			return GETDNS_RETURN_GOOD;
+
+		case STUB_TRY_AGAIN_LATER:
+			_getdns_netreq_change_state(netreq, NET_REQ_NOT_SENT);
+			netreq->node.key = netreq;
+			if (_getdns_rbtree_insert(
+			    &netreq->owner->context->pending_netreqs, &netreq->node))
+				return GETDNS_RETURN_GOOD;
+			return GETDNS_RETURN_NO_UPSTREAM_AVAILABLE;
+
+		default: break;
+		}
+	}
+	return GETDNS_RETURN_NO_UPSTREAM_AVAILABLE;
+}
+
+/* Virtual Method Tables */
+
+static void _nop_cleanup(_getdns_upstream *self)
+{ (void)self; }
+static void _nop_uint32_t(_getdns_upstream *self, uint32_t n)
+{ (void)self; (void)n; }
+static getdns_return_t _nop_as_dict(
+    _getdns_upstream *self, getdns_dict **dict_r)
+{ (void)self; (void)dict_r; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+static const char *_nop_transport_name(_getdns_upstream *self)
+{ (void)self; return "<NO TRANSPORT>"; }
+
+static int _nop_submit(
+    _getdns_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
+{ (void)self; (void)netreq; (void)now_ms
+; fprintf(stderr, "Submit netreq %p with transport %s on upstream %p\n", (void *)netreq, self->vmt->transport_name(self), (void *)self)
+; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+
+static void _set_parent_port(_getdns_upstream *self, uint32_t port)
+{
+	assert(self);
+	if (self->parent)
+		self->parent->vmt->set_port(self->parent, port);
+}
+
+static void _set_parent_tls_port(_getdns_upstream *self, uint32_t port)
+{
+	assert(self);
+	if (self->parent)
+		self->parent->vmt->set_tls_port(self->parent, port);
+}
+
+static const char *_udp_transport_name(_getdns_upstream *self)
+{ (void)self; return "UDP"; }
+
+static const char *_tcp_transport_name(_getdns_upstream *self)
+{ (void)self; return "TCP"; }
+
+static const char *_tls_transport_name(_getdns_upstream *self)
+{ (void)self; return "TLS"; }
+
+static _getdns_upstream_vmt _base_vmt = {
+	_nop_cleanup,
+	_nop_uint32_t,
+	_nop_uint32_t,
+	_nop_as_dict,
+	_nop_transport_name,
+
+	_nop_submit
+};
+static _getdns_upstream_vmt   _address_vmt = {
+	_address_cleanup,
+	_address_set_port,
+	_address_set_tls_port,
+	_address_as_dict,
+	_nop_transport_name,
+
+	_nop_submit
+};
+static _getdns_upstream_vmt       _udp_vmt = {
+	_nop_cleanup,		/* Handled by _address parent */
+	_set_parent_port,
+	_set_parent_tls_port,
+	_nop_as_dict,		/* Handled by _address parent */
+	_udp_transport_name,
+
+	_nop_submit
+};
+static _getdns_upstream_vmt       _tcp_vmt = {
+	_nop_cleanup,		/* Handled by _address parent */
+	_set_parent_port,
+	_set_parent_tls_port,
+	_nop_as_dict,		/* Handled by _address parent */
+	_tcp_transport_name,
+
+	_nop_submit
+};
+static _getdns_upstream_vmt       _tls_vmt = {
+	_nop_cleanup,		/* Handled by _address parent */
+	_set_parent_port,
+	_set_parent_tls_port,
+	_nop_as_dict,		/* Handled by _address parent */
+	_tls_transport_name,
+
+	_nop_submit
+};
+
 

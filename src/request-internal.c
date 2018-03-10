@@ -134,6 +134,9 @@ netreq_reset(getdns_network_req *net_req)
 	uint8_t *buf;
 	/* variables that need to be reset on reinit 
 	 */
+	// GUP {
+	(void) memset(&net_req->gup, 0, sizeof(net_req->gup));
+	// } GUP
 	net_req->first_upstream = NULL;
 	net_req->unbound_id = -1;
 	_getdns_netreq_change_state(net_req, NET_REQ_NOT_SENT);

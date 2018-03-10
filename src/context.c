@@ -1360,7 +1360,7 @@ getdns_context_set_resolvconf(getdns_context *context, const char *resolvconf)
 
 		// GUPS {
 		(void) _getdns_append_address_str_upstream(
-		    &context->gups.u.u, parse, NULL);
+		    &context->gups.super, parse, NULL);
 		// } GUPS
 
 		for (i = 0; i < GETDNS_UPSTREAM_TRANSPORTS; i++) {
@@ -3069,7 +3069,7 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 		 * Let the upstream decide what is secure enough.
 		 */
 		// GUPS {
-		if (_getdns_append_address_str_upstream(&gups.u.u, addrstr, &gup))
+		if (_getdns_append_address_str_upstream(&gups.super, addrstr, &gup))
 			goto invalid_parameter;
 		if (dict && !getdns_dict_get_int(dict, "port", &port))
 			gup->vmt->set_port(gup, port);

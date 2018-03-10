@@ -353,7 +353,9 @@ struct getdns_context {
 	char                 *tls_cipher_list;
 	char                 *tls_curves_list;
 
+	// GUPS {
 	_getdns_upstreams    gups;
+	// } GUPS
 	getdns_upstreams     *upstreams;
 	uint16_t             limit_outstanding_queries;
 	uint32_t             dnssec_allowed_skew;

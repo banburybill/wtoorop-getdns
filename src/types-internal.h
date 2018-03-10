@@ -39,6 +39,7 @@
 #include "getdns/getdns.h"
 #include "getdns/getdns_extra.h"
 #include "util/rbtree.h"
+#include "upstreams.h"
 
 
 /**
@@ -221,6 +222,9 @@ typedef struct getdns_network_req
 	getdns_redirects_t      follow_redirects;
 
 	/* For stub resolving */
+	// GUPs {
+	upstream_iter           gup;
+	// } GUPS
 	struct getdns_upstream *first_upstream;
 	struct getdns_upstream *upstream;
 	int                     fd;
@@ -235,7 +239,9 @@ typedef struct getdns_network_req
 
 	size_t                  keepalive_sent;
 
-	/* Network requests scheduled to write after me */
+	/* Network requests scheduled to write after me
+	 * (head is on a stateful upstream)
+	 */
 	struct getdns_network_req *write_queue_tail;
 
 	/* Some fields to record info for return_call_reporting */
