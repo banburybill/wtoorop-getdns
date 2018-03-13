@@ -179,7 +179,7 @@ INLINE getdns_eventloop_event *getdns_eventloop_event_init(
 #define GETDNS_CLEAR_EVENT(loop, event) \
 	do { if ((event)->ev) (loop)->vmt->clear((loop), (event)); } while(0)
 #define GETDNS_SCHEDULE_EVENT(loop, fd, timeout, event) \
-	do { (loop)->vmt->schedule((loop),(fd),(timeout),(event)); } while(0)
+	((loop)->vmt->schedule((loop),(fd),(timeout),(event)))
 
 INLINE void _dname_canonicalize(const uint8_t *src, uint8_t *dst)
 {
@@ -217,6 +217,8 @@ INLINE uint64_t _getdns_ms_until_expiry2(uint64_t expires, uint64_t *now_ms)
 	if (*now_ms == 0) *now_ms = _getdns_get_now_ms();
 	return *now_ms >= expires ? 0 : expires - *now_ms;
 }
+
+void _getdns_sock_nonblock(int fd);
 
 #endif
 /* util-internal.h */

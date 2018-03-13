@@ -91,7 +91,44 @@ typedef const struct _getdns_upstream_vmt {
 	getdns_return_t (*as_dict)(_getdns_upstream *s, getdns_dict **dict_r);
 	const char *    (*transport_name)(_getdns_upstream *self);
 
+	/* submit() is called by _getdns_submit_stub_request()
+	 * submit() returns:
+	 *   - GETDNS_RETURN_GOOD    : When the request could be successfully
+	 *                             scheduled.  All registration needed for
+	 *                             the netreq with this upstream has been
+	 *                             done.
+	 *
+	 *                             The netreq must be deregisted from this
+	 *                             upstream with a call to revoke().
+         *
+	 *   - STUB_TRY_NEXT_UPSTREAM: When this upstream is backed off and not
+	 *                             ready to schedule the request.
+	 *
+	 *   - STUB_TRY_AGAIN_LATER  : When system resourced are deplated and
+	 *                             another attempt can be made when
+	 *                             resources become available again.
+	 *
+	 *   - GETDNS_RETURN_IO_ERROR: or any other error.  This will cause 
+	 *                             erred() to be called for this upstream,
+	 *                             which does the failure management, such
+	 *                             as backing off this upstream when needed.
+	 */
 	int             (*submit)(_getdns_upstream *s, getdns_network_req *netreq, uint64_t *now_ms);
+
+	/* revoke() deregisters the netreq with the upstream.
+	 * This may involve:
+	 *   - Removing the netreq from data structures within the upstream.
+	 *   - Closing sockets and freeing other resources.
+	 *   - Clearing or rescheduling I/O events.
+	 */
+	void            (*revoke)(_getdns_upstream *s, getdns_network_req *netreq);
+
+	/* erred() is called when the upstream failed (for a request).
+	 * The number of failures are tracked, and the upstream is registered
+	 * to be backed off if needed.  A backed off upstream will result in
+	 * STUB_TRY_NEXT_UPSTREAM returned from submit().
+	 */
+	void            (*erred)(_getdns_upstream *s);
 } _getdns_upstream_vmt;
 
 struct _getdns_upstream {
@@ -102,8 +139,6 @@ struct _getdns_upstream {
 	upstream_caps         may;
 	upstream_caps         can;
 };
-
-getdns_context *_getdns_upstream_get_context(_getdns_upstream *upstream);
 
 _getdns_upstream *_getdns_next_upstream(_getdns_upstream *current,
     upstream_caps cap, _getdns_upstream *stop_at);

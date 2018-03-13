@@ -449,6 +449,7 @@ struct getdns_context {
 	unsigned return_api_information              : 1; /* Not used */
 	unsigned return_both_v4_and_v6               : 1;
 	unsigned return_call_reporting               : 1;
+	unsigned write_udp_immediately               : 1;
 	uint16_t specify_class;
 
 	/*

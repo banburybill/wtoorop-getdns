@@ -318,6 +318,7 @@ typedef struct getdns_dns_req {
 	unsigned edns_cookies				: 1;
 	unsigned edns_client_subnet_private		: 1;
 	unsigned return_call_reporting			: 1;
+	unsigned write_udp_immediately                  : 1;
 	unsigned add_warning_for_bad_dns		: 1;
 
 	/* Internally used by return_validation_chain */

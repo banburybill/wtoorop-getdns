@@ -51,7 +51,7 @@
 #include "gldns/gbuffer.h"
 #include "gldns/pkthdr.h"
 #include "dnssec.h"
-
+#include <fcntl.h>
 
 getdns_return_t
 getdns_dict_util_get_string(getdns_dict * dict, char *name, char **result)
@@ -1602,6 +1602,26 @@ const char * _getdns_auth_str(getdns_auth_state_t auth) {
 		GETDNS_STR_AUTH_OK
 	};
 	return getdns_auth_str_array[auth];
+}
+
+
+/** best effort to set nonblocking */
+void _getdns_sock_nonblock(int sockfd)
+{
+#ifdef HAVE_FCNTL
+	int flag;
+	if((flag = fcntl(sockfd, F_GETFL)) != -1) {
+		flag |= O_NONBLOCK;
+		if(fcntl(sockfd, F_SETFL, flag) == -1) {
+			/* ignore error, continue blockingly */
+		}
+	}
+#elif defined(HAVE_IOCTLSOCKET)
+	unsigned long on = 1;
+	if(ioctlsocket(sockfd, FIONBIO, &on) != 0) {
+		/* ignore error, continue blockingly */
+	}
+#endif
 }
 
 /* util-internal.c */

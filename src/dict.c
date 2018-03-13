@@ -1099,7 +1099,8 @@ getdns_pp_dict(gldns_buffer * buf, size_t indent,
 #endif
 			     strcmp(item->node.key, "return_api_information") == 0 ||
 			     strcmp(item->node.key, "return_both_v4_and_v6") == 0 ||
-			     strcmp(item->node.key, "return_call_reporting") == 0
+			     strcmp(item->node.key, "return_call_reporting") == 0 ||
+			     strcmp(item->node.key, "write_udp_immediately") == 0
 			     ) &&
 			    (strval =
 			     _getdns_get_const_info(item->i.data.n)->name)) {

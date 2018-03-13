@@ -198,6 +198,7 @@ print_usage(FILE *out, const char *progname)
 	fprintf(out, "\t+return_call_reporting\n");
 	fprintf(out, "\t+sit=<cookie>\t\tSend along cookie OPT with value <cookie>\n");
 	fprintf(out, "\t+specify_class=<class>\n");
+	fprintf(out, "\t+write_udp_immediately\n");
 	fprintf(out, "\t+0\t\t\tClear all extensions\n");
 	fprintf(out, "\nsettings in json dict format (like outputted by -i option).\n");
 	fprintf(out, "\noptions:\n");

@@ -1666,6 +1666,7 @@ getdns_context_create_with_extended_memory_functions(
 	result->return_api_information = 0;
 	result->return_both_v4_and_v6 = 0;
 	result->return_call_reporting = 0;
+	result->write_udp_immediately = 0;
 	result->specify_class = GETDNS_RRCLASS_IN;
 
 	result->sys_ctxt  = NULL;
@@ -4139,6 +4140,10 @@ _get_context_settings(getdns_context* context)
 	    result, "return_call_reporting",
 	    context->return_call_reporting ? GETDNS_EXTENSION_TRUE
 	                                   : GETDNS_EXTENSION_FALSE);
+	(void)getdns_dict_set_int(
+	    result, "write_udp_immediately",
+	    context->write_udp_immediately ? GETDNS_EXTENSION_TRUE
+	                                   : GETDNS_EXTENSION_FALSE);
 	(void)getdns_dict_set_int(result, "specify_class",
 	    (uint32_t)context->specify_class);
 
@@ -4940,6 +4945,7 @@ _getdns_context_config_setting(getdns_context *context,
 	EXTENSION_SETTING_BOOL(return_api_information)
 	EXTENSION_SETTING_BOOL(return_both_v4_and_v6)
 	EXTENSION_SETTING_BOOL(return_call_reporting)
+	EXTENSION_SETTING_BOOL(write_udp_immediately)
 
 	} else if (_streq(setting, "add_opt_parameters")) {
 		if (!(r = getdns_dict_get_dict(config_dict, "add_opt_parameters" , &dict))) {

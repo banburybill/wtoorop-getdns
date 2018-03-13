@@ -976,6 +976,8 @@ _getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
 	result->tls_query_padding_blocksize    = context->tls_query_padding_blocksize;
 	result->return_call_reporting          = is_extension_set(extensions,
 	    "return_call_reporting"  , context->return_call_reporting);
+	result->write_udp_immediately          = is_extension_set(extensions,
+	    "write_udp_immediately"  , context->write_udp_immediately);
 	result->add_warning_for_bad_dns        = is_extension_set(extensions,
 	    "add_warning_for_bad_dns", context->add_warning_for_bad_dns);
 	

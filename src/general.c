@@ -525,6 +525,7 @@ validate_extensions(struct getdns_dict * extensions)
 		{"return_both_v4_and_v6"         , t_int , 1},
 		{"return_call_reporting"         , t_int , 1},
 		{"specify_class"                 , t_int , 1},
+		{"write_udp_immediately"         , t_int , 1},
 	};
 
 	struct getdns_dict_item *item;

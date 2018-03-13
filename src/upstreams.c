@@ -32,6 +32,7 @@
 #include "platform.h"
 #include "debug.h"
 #include "general.h"
+#include "gldns/rrdef.h"
 
 #ifndef USE_WINSOCK
 #include <netdb.h>
@@ -41,8 +42,39 @@ typedef unsigned short in_port_t;
 #endif
 
 
-#define STUB_TRY_AGAIN_LATER -24 /* EMFILE, i.e. Out of OS resources */
+#define STUB_TRY_AGAIN_LATER   -24 /* EMFILE, i.e. Out of OS resources */
+#define STUB_TRY_NEXT_UPSTREAM -126
 
+uint64_t
+_getdns_get_time_as_uintt64() {
+
+	struct timeval tv;
+	uint64_t       now;
+
+	if (gettimeofday(&tv, NULL)) {
+		return 0;
+	}
+	now = tv.tv_sec * 1000000 + tv.tv_usec;
+	return now;
+}
+
+getdns_return_t
+_getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms);
+
+static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_ms)
+{
+	if (_getdns_submit_stub_request(netreq, now_ms) == GETDNS_RETURN_GOOD)
+		return; /* netreq still in flight */
+
+	/* TODO: Setting debug_end_time and calling 
+	 * _getdns_check_dns_req_complete(netreq->owner)
+	 * can be done from _getdns_netreq_change_state really.
+	 * When state is changed to something finite.
+	 */
+	_getdns_netreq_change_state(netreq, NET_REQ_ERRORED);
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
+	_getdns_check_dns_req_complete(netreq->owner);
+}
 
 /* Virtual Method Tables (initialized at end of file) */
 
@@ -147,7 +179,7 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
  *****************************************************************************/
 
 getdns_context *
-_getdns_upstream_get_context(_getdns_upstream *upstream)
+_up_context(_getdns_upstream *upstream)
 {
 	if (!upstream)
 		return NULL;
@@ -472,14 +504,14 @@ typedef struct _address_upstream {
 	_tsig_st                 tsig;
 } _address_upstream;
 
-static void _address_cleanup(_getdns_upstream *to_cast)
+static void _address_cleanup(_getdns_upstream *self_up)
 {
 	struct mem_funcs  *mfs;
-	_address_upstream *self = (_address_upstream *)to_cast;
+	_address_upstream *self = (_address_upstream *)self_up;
 
 	assert(self);
 
-	mfs = priv_getdns_context_mf(_getdns_upstream_get_context(to_cast));
+	mfs = priv_getdns_context_mf(_up_context(self_up));
 	assert(mfs); /* invariant of data-structure */
 
 	/* TODO: Complete upstream destruction */
@@ -487,9 +519,9 @@ static void _address_cleanup(_getdns_upstream *to_cast)
 	GETDNS_FREE(*mfs, self);
 }
 
-static void _address_set_port(_getdns_upstream *to_cast, uint32_t port)
+static void _address_set_port(_getdns_upstream *self_up, uint32_t port)
 {
-	_address_upstream *self = (_address_upstream *)to_cast;
+	_address_upstream *self = (_address_upstream *)self_up;
 	assert(self);
 
 	if (self->addr.ss_family == AF_INET)
@@ -499,18 +531,18 @@ static void _address_set_port(_getdns_upstream *to_cast, uint32_t port)
 		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
 }
 
-static void _address_set_tls_port(_getdns_upstream *to_cast, uint32_t port)
+static void _address_set_tls_port(_getdns_upstream *self_up, uint32_t port)
 {
-	_address_upstream *self = (_address_upstream *)to_cast;
+	_address_upstream *self = (_address_upstream *)self_up;
 	assert(self);
 
 	self->tls.tls_port = port;
 }
 
 static getdns_return_t _address_as_dict(
-    _getdns_upstream *to_cast, getdns_dict **dict_r)
+    _getdns_upstream *self_up, getdns_dict **dict_r)
 {
-	_address_upstream *self = (_address_upstream *)to_cast;
+	_address_upstream *self = (_address_upstream *)self_up;
 	getdns_dict *dict = NULL;
 	getdns_return_t r = GETDNS_RETURN_GOOD;
 	getdns_bindata bindata;
@@ -519,7 +551,7 @@ static getdns_return_t _address_as_dict(
 
 	assert(self);
 
-	if (!(dict = getdns_dict_create_with_context(_getdns_upstream_get_context(to_cast))))
+	if (!(dict = getdns_dict_create_with_context(_up_context(self_up))))
 		return GETDNS_RETURN_MEMORY_ERROR;
 
 	switch (self->addr.ss_family) {
@@ -591,7 +623,7 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 	assert(parent);
 	assert(addr_str); /* contract for usage within library*/
 
-	mfs = priv_getdns_context_mf(_getdns_upstream_get_context(parent));
+	mfs = priv_getdns_context_mf(_up_context(parent));
 	assert(mfs); /* invariant of data-structure */
 
 	if (!(up = GETDNS_MALLOC(*mfs, _address_upstream)))
@@ -648,6 +680,266 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 	return GETDNS_RETURN_GOOD;
 }
 
+static _address_upstream *addr_up(_getdns_upstream *up)
+{
+	return up->parent && up->parent->vmt == &_address_vmt
+	     ? (_address_upstream *)up->parent : NULL;
+}
+
+static _stateless_upstream *udp_up(_getdns_upstream *up)
+{
+	return up->vmt == &_udp_vmt ? (_stateless_upstream *)up: NULL;
+}
+
+ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
+    getdns_network_req *netreq, _edns_cookie_st *cookie, _tsig_st *tsig)
+{
+	_address_upstream *addr = addr_up(up);
+
+	GLDNS_ID_SET(netreq->query, (uint16_t)arc4random());
+	if (netreq->opt) {
+		_getdns_network_req_clear_upstream_options(netreq);
+
+		if (netreq->owner->edns_cookies) {
+			/* TODO: Handle cookies */
+			(void)cookie;
+		}
+
+		if (netreq->owner->edns_client_subnet_private) {
+
+			/* see https://tools.ietf.org/html/rfc7871#section-7.1.2
+			 * all-zeros is a request to not leak the data further:
+			 * A two byte FAMILY field is a SHOULD even when SOURCE
+			 * and SCOPE are 0.
+			 * "\x00\x02"  FAMILY: 2 for IPv6 upstreams in network byte order, or
+			 * "\x00\x01"  FAMILY: 1 for IPv4 upstreams in network byte order, then:
+			 * "\x00"  SOURCE PREFIX-LENGTH: 0
+			 * "\x00";  SCOPE PREFIX-LENGTH: 0
+			 */
+			if (_getdns_network_req_add_upstream_option(
+			    netreq, GLDNS_EDNS_CLIENT_SUBNET, 4,
+			    ( !addr || addr->addr.ss_family != AF_INET6
+			    ?  "\x00\x01\x00\x00" : "\x00\x02\x00\x00" )))
+				return -1;
+		}
+	}
+	if (!tsig || tsig->tsig_alg == GETDNS_NO_TSIG)
+		return netreq->response - netreq->query;
+
+	return -1; /* TODO: Add tsig option */
+}
+
+static void
+_udp_revoke(_getdns_upstream *self_up, getdns_network_req *netreq)
+{
+	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
+	(void)self_up;
+
+	if (netreq->event.ev)
+		GETDNS_CLEAR_EVENT(netreq->owner->loop, &netreq->event);
+	if (netreq->fd >= 0) {
+		_getdns_closesocket(netreq->fd);
+		netreq->fd = -1;
+	}
+}
+
+static void
+_udp_erred(_getdns_upstream *self_up)
+{
+	_stateless_upstream *self = udp_up(self_up);
+
+	if (self && --self->to_retry == 0) {
+		if (self->back_off * 2 >   _up_context(self_up)->max_backoff_value)
+			self->to_retry = -(_up_context(self_up)->max_backoff_value);
+		else	self->to_retry = -(self->back_off * 2);
+	}
+}
+
+static void
+_udp_timeout_cb(void *userarg)
+{
+	getdns_network_req *netreq = (getdns_network_req *)userarg;
+
+	assert(netreq);
+	if (!netreq->gup.current)
+		_udp_revoke(NULL, netreq);
+	else {
+		netreq->gup.current->vmt->revoke(netreq->gup.current, netreq);
+		netreq->gup.current->vmt->erred(netreq->gup.current);
+	}
+	_getdns_netreq_change_state(netreq, NET_REQ_TIMED_OUT);
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
+	_getdns_check_dns_req_complete(netreq->owner);
+}
+
+static void
+_udp_read_cb(void *userarg)
+{
+	getdns_network_req *netreq = (getdns_network_req *)userarg;
+	uint64_t now_ms = 0;
+	getdns_dns_req *dnsreq = netreq->owner;
+	_stateless_upstream *up = udp_up(netreq->gup.current);
+	ssize_t       read;
+	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_READ, __FUNC__, (void*)netreq);
+
+	read = recvfrom(netreq->fd, (void *)netreq->response,
+	    netreq->max_udp_payload_size + 1, /* If read == max_udp_payload_size
+	                                       * then all is good.  If read ==
+	                                       * max_udp_payload_size + 1, then
+	                                       * we receive more then requested!
+	                                       * i.e. overflow
+	                                       */
+	    0, NULL, NULL);
+	if (read == -1 && (_getdns_socketerror_wants_retry() ||
+		           _getdns_socketerror() == _getdns_ECONNRESET))
+		return; /* Try again later */
+
+	if (read == -1) {
+		DEBUG_STUB("%s %-35s: MSG: %p error while reading from socket:"
+		           " %s\n", STUB_DEBUG_READ, __FUNC__, (void*)netreq
+			   , _getdns_errnostr());
+
+		if (!up)
+			_udp_revoke(NULL, netreq);
+		else {
+			up->super.vmt->revoke(&up->super, netreq);
+			up->super.vmt->erred(&up->super);
+		}
+		_fallback_resubmit_netreq(netreq, &now_ms);
+		return;
+	}
+	if (read < GLDNS_HEADER_SIZE)
+		return; /* Not DNS, wait for proper packet */
+	
+	if (GLDNS_ID_WIRE(netreq->response) != GLDNS_ID_WIRE(netreq->query))
+		return; /* Cache poisoning attempt ;), wait for proper packet */
+
+	/* TODO: Cookie validation
+	if (netreq->owner->edns_cookies && match_and_process_server_cookie(
+	    upstream, netreq->response, read))
+		return;
+	*/
+	if (up)
+		up->super.vmt->revoke(&up->super, netreq);
+	else	_udp_revoke(NULL, netreq);
+	if (GLDNS_TC_WIRE(netreq->response)) {
+		DEBUG_STUB("%s %-35s: MSG: %p TC bit set in response \n", STUB_DEBUG_READ, 
+		             __FUNC__, (void*)netreq);
+		/* TODO: tc bit handling */
+	}
+	netreq->response_len = read;
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
+	if (up) {
+		up->n_responses++;
+		up->back_off = 1;
+		if (up->n_responses % 100 == 1)
+			_getdns_context_log(_up_context(&up->super),
+			    GETDNS_LOG_UPSTREAM_STATS, GETDNS_LOG_INFO,
+			    "%-40s : Upstream   : UDP - Resps=%6d, Timeouts  =%6d (logged every 100 responses)\n",
+			    addr_up(&up->super)->addr_str, (int)up->n_responses, (int)up->n_timeouts);
+	}
+	_getdns_netreq_change_state(netreq, NET_REQ_FINISHED);
+	_getdns_check_dns_req_complete(dnsreq);
+}
+
+
+int
+_udp_write(_stateless_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
+{
+	getdns_dns_req *dnsreq = netreq->owner;
+	ssize_t         pkt_len;
+	ssize_t         written;
+	_address_upstream *addr = addr_up(&self->super);
+	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_WRITE, 
+	             __FUNC__, (void *)netreq);
+
+	if (netreq->event.ev)
+		GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
+
+	if (!addr || (pkt_len = _prepare_netreq_packet_for_send(
+	    &self->super, netreq, &self->cookie, &addr->tsig)) < 0)
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	if (netreq->opt) {
+		/* Relevant for UDP only */
+		if (netreq->edns_maximum_udp_payload_size == -1)
+			gldns_write_uint16(netreq->opt + 3,
+			    ( netreq->max_udp_payload_size =
+			      addr->addr.ss_family == AF_INET6
+			    ? 1232 : 1432));
+	}
+	if (pkt_len != (written = sendto(
+	    netreq->fd, (const void *)netreq->query, (size_t)pkt_len, 0,
+	    (struct sockaddr *)&addr->addr, addr->addr_len))) {
+
+#if defined(STUB_DEBUG) && STUB_DEBUG
+		if (written == -1)
+			DEBUG_STUB( "%s %-35s: MSG: %p error: %s\n"
+				  , STUB_DEBUG_WRITE, __FUNC__, (void *)netreq
+				  , _getdns_errnostr());
+		else
+			DEBUG_STUB( "%s %-35s: MSG: %p returned: %d, expected: %d\n"
+				  , STUB_DEBUG_WRITE, __FUNC__, (void *)netreq
+				  , (int)written, (int)pkt_len);
+#else
+		(void)written;
+#endif
+		return GETDNS_RETURN_IO_ERROR;
+	}
+	netreq->debug_start_time = _getdns_get_time_as_uintt64();
+	netreq->debug_udp = 1;
+
+	GETDNS_SCHEDULE_EVENT(dnsreq->loop, netreq->fd,
+	    _getdns_ms_until_expiry2(dnsreq->expires, now_ms),
+	    getdns_eventloop_event_init(&netreq->event, netreq,
+	    _udp_read_cb, NULL, _udp_timeout_cb));
+
+	return GETDNS_RETURN_GOOD;
+}
+
+static void
+_udp_write_cb(void *userarg)
+{
+	getdns_network_req *netreq = (getdns_network_req *)userarg;
+	uint64_t now_ms = 0;
+	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_WRITE, 
+	             __FUNC__, (void *)netreq);
+
+	if (_udp_write(udp_up(netreq->gup.current), netreq, &now_ms)) {
+		_udp_revoke(netreq->gup.current, netreq);
+		_udp_erred(netreq->gup.current);
+		_fallback_resubmit_netreq(netreq, &now_ms);
+	}
+}
+
+int
+_udp_submit(_getdns_upstream *self_up,
+    getdns_network_req *netreq, uint64_t *now_ms)
+{
+	_stateless_upstream *self = udp_up(self_up);
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+	           (void*)netreq, netreq->request_type);
+
+	if (  self->to_retry <= 0 &&
+	    ++self->to_retry <= 0)
+		return STUB_TRY_NEXT_UPSTREAM;
+
+	netreq->fd = socket(addr_up(self_up)->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (netreq->fd < 0)
+		return _getdns_resource_depletion()
+		     ? STUB_TRY_AGAIN_LATER
+		     : (int)GETDNS_RETURN_IO_ERROR;
+
+	_getdns_sock_nonblock(netreq->fd);
+	if (netreq->owner->write_udp_immediately)
+		return _udp_write(self, netreq, now_ms);
+
+	return GETDNS_SCHEDULE_EVENT(netreq->owner->loop, netreq->fd,
+	    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
+	     getdns_eventloop_event_init(&netreq->event, netreq,
+		     NULL, _udp_write_cb, _udp_timeout_cb));
+}
+
 getdns_return_t
 _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 {
@@ -671,10 +963,32 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 				return GETDNS_RETURN_GOOD;
 			return GETDNS_RETURN_NO_UPSTREAM_AVAILABLE;
 
-		default: break;
+		case STUB_TRY_NEXT_UPSTREAM:
+			break;
+
+		default:
+			/* Not submitted, so no revoke needed */
+			up->vmt->erred(up);
+			break;
 		}
 	}
 	return GETDNS_RETURN_NO_UPSTREAM_AVAILABLE;
+}
+
+void
+_getdns_cancel_stub_request(getdns_network_req *netreq)
+{
+	DEBUG_STUB("%s %-35s: MSG: %p\n",
+	           STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
+	if (netreq->gup.current)
+		netreq->gup.current->vmt->revoke(netreq->gup.current, netreq);
+	else	_udp_revoke(NULL, netreq);
+	_getdns_netreq_change_state(netreq, NET_REQ_CANCELED);
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
+	/* Do not call _getdns_check_dns_req_complete(netreq->owner);
+	 * since that will trigger callbacks, which we do not want
+	 * with explicit canceling.
+	 */
 }
 
 /* Virtual Method Tables */
@@ -694,6 +1008,11 @@ static int _nop_submit(
 { (void)self; (void)netreq; (void)now_ms
 ; fprintf(stderr, "Submit netreq %p with transport %s on upstream %p\n", (void *)netreq, self->vmt->transport_name(self), (void *)self)
 ; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+
+static void _nop_revoke(_getdns_upstream *self, getdns_network_req *netreq)
+{ (void)self; (void)netreq; ; fprintf(stderr, "Revoke netreq %p with transport %s on upstream %p\n", (void *)netreq, self->vmt->transport_name(self), (void *)self); }
+static void _nop_erred(_getdns_upstream *self)
+{ (void)self; fprintf(stderr, "Upstream %p with transport %s erred\n", (void *)self, self->vmt->transport_name(self)); }
 
 static void _set_parent_port(_getdns_upstream *self, uint32_t port)
 {
@@ -725,7 +1044,9 @@ static _getdns_upstream_vmt _base_vmt = {
 	_nop_as_dict,
 	_nop_transport_name,
 
-	_nop_submit
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
 };
 static _getdns_upstream_vmt   _address_vmt = {
 	_address_cleanup,
@@ -734,7 +1055,9 @@ static _getdns_upstream_vmt   _address_vmt = {
 	_address_as_dict,
 	_nop_transport_name,
 
-	_nop_submit
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
 };
 static _getdns_upstream_vmt       _udp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
@@ -743,7 +1066,9 @@ static _getdns_upstream_vmt       _udp_vmt = {
 	_nop_as_dict,		/* Handled by _address parent */
 	_udp_transport_name,
 
-	_nop_submit
+	_udp_submit,
+	_udp_revoke,
+	_udp_erred,
 };
 static _getdns_upstream_vmt       _tcp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
@@ -752,7 +1077,9 @@ static _getdns_upstream_vmt       _tcp_vmt = {
 	_nop_as_dict,		/* Handled by _address parent */
 	_tcp_transport_name,
 
-	_nop_submit
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
 };
 static _getdns_upstream_vmt       _tls_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
@@ -761,7 +1088,9 @@ static _getdns_upstream_vmt       _tls_vmt = {
 	_nop_as_dict,		/* Handled by _address parent */
 	_tls_transport_name,
 
-	_nop_submit
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
 };
 
 

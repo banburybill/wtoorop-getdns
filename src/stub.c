@@ -558,6 +558,7 @@ upstream_failed(getdns_upstream *upstream, int during_setup)
 	_getdns_upstream_shutdown(upstream);
 }
 
+#if 0
 void
 _getdns_cancel_stub_request(getdns_network_req *netreq)
 {
@@ -569,6 +570,7 @@ _getdns_cancel_stub_request(getdns_network_req *netreq)
 		netreq->fd = -1;
 	}
 }
+#endif
 
 static void
 stub_timeout_cb(void *userarg)
@@ -1490,6 +1492,7 @@ stub_tls_write(getdns_upstream *upstream, getdns_tcp_state *tcp,
 	return STUB_TCP_ERROR;
 }
 
+#if 0
 uint64_t
 _getdns_get_time_as_uintt64() {
 
@@ -1502,6 +1505,7 @@ _getdns_get_time_as_uintt64() {
 	now = tv.tv_sec * 1000000 + tv.tv_usec;
 	return now;
 }
+#endif
 
 
 /**************************/
