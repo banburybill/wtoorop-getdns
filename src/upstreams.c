@@ -80,6 +80,7 @@ static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_
 
 static _getdns_upstream_vmt      _base_vmt;
 static _getdns_upstream_vmt   _address_vmt;
+static _getdns_upstream_vmt     _named_vmt;
 static _getdns_upstream_vmt       _udp_vmt;
 static _getdns_upstream_vmt       _tcp_vmt;
 static _getdns_upstream_vmt       _tls_vmt;
@@ -96,6 +97,10 @@ _getdns_upstreams_init(_getdns_upstreams *upstreams, getdns_context *context)
 	upstreams->super.next = &upstreams->super;
 	upstreams->super.vmt  = &_base_vmt;
 }
+
+static inline _getdns_upstreams *_up_upstreams(_getdns_upstream *up)
+{ if (!up) return NULL; while (up->parent) up = up->parent
+; return up->vmt == &_base_vmt ? (_getdns_upstreams *)up : NULL; }
 
 void
 _getdns_context_set_upstreams(getdns_context *context, _getdns_upstreams *upstreams)
@@ -132,7 +137,7 @@ _getdns_upstreams_cleanup(_getdns_upstreams *upstreams)
 	if (!(start = current = upstreams->super.children))
 		; /* pass */
 	else do {
-		current->vmt->cleanup(current);
+		UPSTREAM_CLEANUP(current);
 		current = current->next;
 	} while (current && current != start);
 
@@ -152,7 +157,7 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 	if (!(start = current = upstreams->super.children))
 		; /* pass */
 	else do {
-		if ((r = current->vmt->as_dict(current, &dict))) {
+		if ((r = UPSTREAM_AS_DICT(current, &dict))) {
 			if (list) getdns_list_destroy(list);
 			return r;
 		}
@@ -178,15 +183,9 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 /* Functions for _getdns_upstream data-structure traversal & maintenance 
  *****************************************************************************/
 
-getdns_context *
-_up_context(_getdns_upstream *upstream)
-{
-	if (!upstream)
-		return NULL;
-	while (upstream->parent)
-		upstream = upstream->parent;
-	return ((_getdns_upstreams *)upstream)->context;
-}
+static inline getdns_context *_up_context(_getdns_upstream *upstream)
+{ _getdns_upstreams *upstreams = _up_upstreams(upstream)
+; return upstreams ? upstreams->context : NULL; }
 
 static _getdns_upstream *
 _simple_next_upstream(_getdns_upstream *current)
@@ -226,6 +225,7 @@ _upstream_append(_getdns_upstream *parent, _getdns_upstream *child)
 	assert(parent);
 	assert(child);
 
+	child->parent = parent;
 	if (!parent->children) {
 		parent->children = child;
 		child->next = child;
@@ -365,6 +365,9 @@ _udp_upstream_init(_stateless_upstream *up)
 	up->super.vmt = &_udp_vmt;
 }
 
+static inline _stateless_upstream *as_udp_up(_getdns_upstream *up)
+{ return up && up->vmt == &_udp_vmt ? (_stateless_upstream *)up : NULL; }
+
 /*
  * typedef enum getdns_conn_state {
  * 	GETDNS_CONN_CLOSED,
@@ -377,6 +380,7 @@ _udp_upstream_init(_stateless_upstream *up)
 
 typedef struct _stateful_upstream {
 	_getdns_upstream        super;
+
 	_edns_cookie_st         cookie;
 
 	int                     fd;
@@ -447,22 +451,25 @@ _tcp_upstream_init(_stateful_upstream *up)
 	up->super.vmt = &_tcp_vmt;
 }
 
+static inline _stateful_upstream *as_tcp_up(_getdns_upstream *up)
+{ return up && up->vmt == &_tcp_vmt ? (_stateful_upstream *)up : NULL; }
+
 typedef struct _tls_upstream {
 	_stateful_upstream super;
 	
+	/* Settings */
 	uint16_t               tls_port;
+        char                  *tls_cipher_list;
+        char                  *tls_curves_list;
+        char                   tls_auth_name[256];
+        sha256_pin_t          *tls_pubkey_pinset;
+
+	/* State */
         SSL*                   tls_obj;
         SSL_SESSION*           tls_session;
         getdns_tls_hs_state_t  tls_hs_state;
         getdns_auth_state_t    tls_auth_state;
         unsigned               tls_fallback_ok : 1;
-        char                  *tls_cipher_list;
-        char                  *tls_curves_list;
-        /* Auth credentials*/
-        char                   tls_auth_name[256];
-        sha256_pin_t          *tls_pubkey_pinset;
-
-	/* These are running totals or historical info */
 	getdns_auth_state_t    best_tls_auth_state;
 	getdns_auth_state_t    last_tls_auth_state;
 } _tls_upstream;
@@ -474,13 +481,22 @@ _tls_upstream_init(_tls_upstream *up)
 	up->super.super.vmt = &_tls_vmt;
 	up->super.super.may = CAP_MIGHT | CAP_STATEFUL | CAP_ENCRYPTED;
 
+	/* Settings */
 	up->tls_port = 853;
-	up->tls_hs_state = GETDNS_HS_NONE;
+	up->tls_cipher_list = NULL;
+	up->tls_curves_list = NULL;
 	up->tls_auth_name[0] = '\0';
+	up->tls_pubkey_pinset = NULL;
+
+	/* State */
+	up->tls_hs_state = GETDNS_HS_NONE;
 	up->tls_auth_state = GETDNS_AUTH_NONE;
 	up->last_tls_auth_state = GETDNS_AUTH_NONE;
 	up->best_tls_auth_state = GETDNS_AUTH_NONE;
 }
+
+static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
+{ return up && up->vmt == &_tls_vmt ? (_tls_upstream *)up : NULL; }
 
 typedef struct _tsig_st {
 	uint8_t          tsig_dname[256];
@@ -493,38 +509,41 @@ typedef struct _tsig_st {
 typedef struct _address_upstream {
 	_getdns_upstream         super;
 	
+	/* settings */
 	socklen_t                addr_len;
 	struct sockaddr_storage  addr;
-	char                     addr_str[INET6_ADDRSTRLEN];
+	char                     addr_str[128];
 
+	_tsig_st                 tsig;
+
+	/* State */
 	_stateless_upstream      udp;
 	_stateful_upstream       tcp;
 	_tls_upstream            tls;
-
-	_tsig_st                 tsig;
 } _address_upstream;
+
+static inline _address_upstream *as_address_up(_getdns_upstream *up)
+{ return up && up->vmt == &_address_vmt ? (_address_upstream *)up : NULL; }
 
 static void _address_cleanup(_getdns_upstream *self_up)
 {
 	struct mem_funcs  *mfs;
-	_address_upstream *self = (_address_upstream *)self_up;
 
-	assert(self);
+	if ((mfs = priv_getdns_context_mf(_up_context(self_up)))) {
+		/* TODO: complete address destruction */
 
-	mfs = priv_getdns_context_mf(_up_context(self_up));
-	assert(mfs); /* invariant of data-structure */
-
-	/* TODO: Complete upstream destruction */
-
-	GETDNS_FREE(*mfs, self);
+		GETDNS_FREE(*mfs, self_up);
+	}
 }
 
 static void _address_set_port(_getdns_upstream *self_up, uint32_t port)
 {
-	_address_upstream *self = (_address_upstream *)self_up;
-	assert(self);
+	_address_upstream *self = as_address_up(self_up);
 
-	if (self->addr.ss_family == AF_INET)
+	if (!self)
+		; /* pass */
+
+	else if (self->addr.ss_family == AF_INET)
 		((struct sockaddr_in *)(&self->addr))->sin_port = htons(port);
 
 	else if (self->addr.ss_family == AF_INET6)
@@ -533,23 +552,24 @@ static void _address_set_port(_getdns_upstream *self_up, uint32_t port)
 
 static void _address_set_tls_port(_getdns_upstream *self_up, uint32_t port)
 {
-	_address_upstream *self = (_address_upstream *)self_up;
-	assert(self);
+	_address_upstream *self = as_address_up(self_up);
 
-	self->tls.tls_port = port;
+	if (self) self->tls.tls_port = port;
 }
 
 static getdns_return_t _address_as_dict(
     _getdns_upstream *self_up, getdns_dict **dict_r)
 {
-	_address_upstream *self = (_address_upstream *)self_up;
+	_address_upstream *self = as_address_up(self_up);
 	getdns_dict *dict = NULL;
 	getdns_return_t r = GETDNS_RETURN_GOOD;
 	getdns_bindata bindata;
-	char addr_str[1024], *b;
+	char addr_str[128], *b;
 	uint16_t port;
 
-	assert(self);
+
+	if (!self)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
 	if (!(dict = getdns_dict_create_with_context(_up_context(self_up))))
 		return GETDNS_RETURN_MEMORY_ERROR;
@@ -610,23 +630,39 @@ static getdns_return_t _address_as_dict(
 	return GETDNS_RETURN_GOOD;
 }
 
+static const char *
+_address_get_name(_getdns_upstream *self_up)
+{
+	_address_upstream *self = as_address_up(self_up);
+	return self ? self->addr_str : NULL;
+}
+
+static const struct sockaddr *
+_address_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
+{
+	_address_upstream *self = as_address_up(self_up);
+
+	if (self) {
+		if (addrlen)
+			*addrlen = self->addr_len;
+		return (struct sockaddr *)&self->addr;
+	}
+	return NULL;
+}
+
 static getdns_return_t
-_getdns_append_address_upstream(_getdns_upstream *parent, struct addrinfo *ai,
-    const char *addr_str, _getdns_upstream **new_upstream)
+_getdns_create_address_upstream(struct mem_funcs *mfs,
+    struct addrinfo *ai, const char *addr_str, _getdns_upstream **new_upstream)
 {
 	_address_upstream *up;
-	struct mem_funcs  *mfs;
+
 	assert(ai);
 	assert(addr_str);
-
-	mfs = priv_getdns_context_mf(_up_context(parent));
-	assert(mfs); /* invariant of data-structure */
 
 	if (!(up = GETDNS_MALLOC(*mfs, _address_upstream)))
 		return GETDNS_RETURN_MEMORY_ERROR;
 
 	(void) memset(up, 0, sizeof(*up));
-	up->super.parent             = parent;
 	up->super.children           = &up->udp.super;
 	up->super.vmt                = &_address_vmt;
 
@@ -653,7 +689,114 @@ _getdns_append_address_upstream(_getdns_upstream *parent, struct addrinfo *ai,
 	up->addr.ss_family = ai->ai_family;
 	up->tsig.tsig_alg = GETDNS_NO_TSIG;
 
-	_upstream_append(parent, &up->super);
+	if (new_upstream)
+		*new_upstream = &up->super;
+
+	return GETDNS_RETURN_GOOD;
+}
+
+typedef struct _named_upstream {
+	_getdns_upstream         super;
+	
+	char                     name[1024];
+
+	uint16_t                 port;
+	uint16_t                 tls_port;
+
+	_tsig_st                 tsig;
+} _named_upstream;
+
+static inline _named_upstream *as_named_up(_getdns_upstream *up)
+{ return up && up->vmt == &_named_vmt ? (_named_upstream *)up : NULL; }
+
+static void _named_cleanup(_getdns_upstream *self_up)
+{
+	_getdns_upstream *up;
+	struct mem_funcs *mfs;
+
+	if (!self_up)
+		return;
+
+	for (up = self_up->children; up; up = up->next) {
+		UPSTREAM_CLEANUP(up);
+	}
+	self_up->children = NULL;
+	if ((mfs = priv_getdns_context_mf(_up_context(self_up)))) {
+		/* TODO: complete destruction */
+
+		GETDNS_FREE(*mfs, self_up);
+	}
+}
+
+static void _named_set_port(_getdns_upstream *self_up, uint32_t port)
+{
+	_named_upstream *self = as_named_up(self_up);
+	self->port = port;
+}
+
+static void _named_set_tls_port(_getdns_upstream *self_up, uint32_t tls_port)
+{
+	_named_upstream *self = as_named_up(self_up);
+	self->tls_port = tls_port;
+}
+
+static getdns_return_t _named_as_dict(
+    _getdns_upstream *self_up, getdns_dict **dict_r)
+{
+	_named_upstream *self = as_named_up(self_up);
+	getdns_dict *dict = NULL;
+	getdns_return_t r = GETDNS_RETURN_GOOD;
+
+	if (!self)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!(dict = getdns_dict_create_with_context(_up_context(self_up))))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	if ((r = getdns_dict_util_set_string(dict, "name", self->name)))
+		; /* error */
+
+	else if (self->port != 53 &&
+	    (r = getdns_dict_set_int(dict, "port", (uint32_t)self->port)))
+		; /* error */
+
+	else if (self->tls_port != 853 &&
+	    (r = getdns_dict_set_int(dict, "tls_port", (uint32_t)self->tls_port)))
+		; /* error */
+
+	else {
+		*dict_r = dict;
+		return GETDNS_RETURN_GOOD;
+	}
+	getdns_dict_destroy(dict);
+	return r;
+}
+
+static const char *_named_get_name(_getdns_upstream *self_up)
+{
+	_named_upstream *self = as_named_up(self_up);
+	return self ? self->name : "<NO NAME>";
+}
+
+static getdns_return_t
+_getdns_create_named_upstream(struct mem_funcs *mfs,
+    const char *name, _getdns_upstream **new_upstream)
+{
+	_named_upstream *up;
+
+	if (!(up = GETDNS_MALLOC(*mfs, _named_upstream)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	(void) memset(up, 0, sizeof(*up));
+	up->super.vmt = &_named_vmt;
+
+	(void) strlcpy(up->name, name, sizeof(up->name));
+	up->port = 53;
+	up->tls_port = 853;
+
+	if (new_upstream)
+		*new_upstream = &up->super;
+
 	return GETDNS_RETURN_GOOD;
 }
 
@@ -661,42 +804,39 @@ getdns_return_t
 _getdns_append_upstream(_getdns_upstream *parent,
     const char *addr_str, _getdns_upstream **new_upstream)
 {
-	struct addrinfo  hints;
-	struct addrinfo *ai = NULL;
-	getdns_return_t  r;
+	struct addrinfo   hints;
+	struct addrinfo  *ai = NULL;
+	getdns_return_t   r;
+	_getdns_upstream *up = NULL;
+	struct mem_funcs *mfs;
+
 
 	assert(parent);
 	assert(addr_str); /* contract for usage within library*/
 
+	if (!(mfs = priv_getdns_context_mf(_up_context(parent))))
+		return GETDNS_RETURN_GENERIC_ERROR;
+
 	(void) memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family    = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
 	hints.ai_flags     = AI_NUMERICHOST; /* No reverse name lookups */
-	if (getaddrinfo(addr_str, "53", &hints, &ai) || !ai) {
-		/* named upstream */
-		return GETDNS_RETURN_NOT_IMPLEMENTED;
-	}
-	r = _getdns_append_address_upstream(
-	    parent, ai, addr_str, new_upstream);
+
+	if (getaddrinfo(addr_str, "53", &hints, &ai) || !ai)
+		r = _getdns_create_named_upstream(mfs, addr_str, &up);
+	else
+		r = _getdns_create_address_upstream(mfs, ai, addr_str, &up);
 	freeaddrinfo(ai);
-	return r;
-}
-
-static _address_upstream *addr_up(_getdns_upstream *up)
-{
-	return up->parent && up->parent->vmt == &_address_vmt
-	     ? (_address_upstream *)up->parent : NULL;
-}
-
-static _stateless_upstream *udp_up(_getdns_upstream *up)
-{
-	return up->vmt == &_udp_vmt ? (_stateless_upstream *)up: NULL;
+	if (r)
+		return r;
+	_upstream_append(parent, up);
+	if (new_upstream)
+		*new_upstream = up;
+	return GETDNS_RETURN_GOOD;
 }
 
 ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
     getdns_network_req *netreq, _edns_cookie_st *cookie, _tsig_st *tsig)
 {
-	_address_upstream *addr = addr_up(up);
-
 	GLDNS_ID_SET(netreq->query, (uint16_t)arc4random());
 	if (netreq->opt) {
 		_getdns_network_req_clear_upstream_options(netreq);
@@ -707,6 +847,7 @@ ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
 		}
 
 		if (netreq->owner->edns_client_subnet_private) {
+			const struct sockaddr *addr = UPSTREAM_GET_ADDR(up, NULL);
 
 			/* see https://tools.ietf.org/html/rfc7871#section-7.1.2
 			 * all-zeros is a request to not leak the data further:
@@ -719,8 +860,8 @@ ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
 			 */
 			if (_getdns_network_req_add_upstream_option(
 			    netreq, GLDNS_EDNS_CLIENT_SUBNET, 4,
-			    ( !addr || addr->addr.ss_family != AF_INET6
-			    ?  "\x00\x01\x00\x00" : "\x00\x02\x00\x00" )))
+			    ( !addr || addr->sa_family != AF_INET6
+			    ? "\x00\x01\x00\x00" : "\x00\x02\x00\x00" )))
 				return -1;
 		}
 	}
@@ -747,7 +888,7 @@ _udp_revoke(_getdns_upstream *self_up, getdns_network_req *netreq)
 static void
 _udp_erred(_getdns_upstream *self_up)
 {
-	_stateless_upstream *self = udp_up(self_up);
+	_stateless_upstream *self = as_udp_up(self_up);
 
 	if (self && --self->to_retry == 0) {
 		if (self->back_off * 2 >   _up_context(self_up)->max_backoff_value)
@@ -765,8 +906,8 @@ _udp_timeout_cb(void *userarg)
 	if (!netreq->gup.current)
 		_udp_revoke(NULL, netreq);
 	else {
-		netreq->gup.current->vmt->revoke(netreq->gup.current, netreq);
-		netreq->gup.current->vmt->erred(netreq->gup.current);
+		UPSTREAM_REVOKE(netreq->gup.current, netreq);
+		UPSTREAM_ERRED(netreq->gup.current);
 	}
 	_getdns_netreq_change_state(netreq, NET_REQ_TIMED_OUT);
 	netreq->debug_end_time = _getdns_get_time_as_uintt64();
@@ -779,7 +920,7 @@ _udp_read_cb(void *userarg)
 	getdns_network_req *netreq = (getdns_network_req *)userarg;
 	uint64_t now_ms = 0;
 	getdns_dns_req *dnsreq = netreq->owner;
-	_stateless_upstream *up = udp_up(netreq->gup.current);
+	_stateless_upstream *up = as_udp_up(netreq->gup.current);
 	ssize_t       read;
 	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_READ, __FUNC__, (void*)netreq);
 
@@ -803,8 +944,8 @@ _udp_read_cb(void *userarg)
 		if (!up)
 			_udp_revoke(NULL, netreq);
 		else {
-			up->super.vmt->revoke(&up->super, netreq);
-			up->super.vmt->erred(&up->super);
+			UPSTREAM_REVOKE(&up->super, netreq);
+			UPSTREAM_ERRED(&up->super);
 		}
 		_fallback_resubmit_netreq(netreq, &now_ms);
 		return;
@@ -821,7 +962,7 @@ _udp_read_cb(void *userarg)
 		return;
 	*/
 	if (up)
-		up->super.vmt->revoke(&up->super, netreq);
+		UPSTREAM_REVOKE(&up->super, netreq);
 	else	_udp_revoke(NULL, netreq);
 	if (GLDNS_TC_WIRE(netreq->response)) {
 		DEBUG_STUB("%s %-35s: MSG: %p TC bit set in response \n", STUB_DEBUG_READ, 
@@ -837,7 +978,7 @@ _udp_read_cb(void *userarg)
 			_getdns_context_log(_up_context(&up->super),
 			    GETDNS_LOG_UPSTREAM_STATS, GETDNS_LOG_INFO,
 			    "%-40s : Upstream   : UDP - Resps=%6d, Timeouts  =%6d (logged every 100 responses)\n",
-			    addr_up(&up->super)->addr_str, (int)up->n_responses, (int)up->n_timeouts);
+			    UPSTREAM_GET_NAME(&up->super), (int)up->n_responses, (int)up->n_timeouts);
 	}
 	_getdns_netreq_change_state(netreq, NET_REQ_FINISHED);
 	_getdns_check_dns_req_complete(dnsreq);
@@ -847,10 +988,12 @@ _udp_read_cb(void *userarg)
 int
 _udp_write(_stateless_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
 {
-	getdns_dns_req *dnsreq = netreq->owner;
-	ssize_t         pkt_len;
-	ssize_t         written;
-	_address_upstream *addr = addr_up(&self->super);
+	getdns_dns_req        *dnsreq = netreq->owner;
+	ssize_t                pkt_len;
+	ssize_t                written;
+	socklen_t              addrlen;
+	const struct sockaddr *addr = UPSTREAM_GET_ADDR(&self->super, &addrlen);
+
 	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_WRITE, 
 	             __FUNC__, (void *)netreq);
 
@@ -858,7 +1001,7 @@ _udp_write(_stateless_upstream *self, getdns_network_req *netreq, uint64_t *now_
 		GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
 
 	if (!addr || (pkt_len = _prepare_netreq_packet_for_send(
-	    &self->super, netreq, &self->cookie, &addr->tsig)) < 0)
+	    &self->super, netreq, &self->cookie, NULL)) < 0) /* TODO: pass TSIG */
 		return GETDNS_RETURN_GENERIC_ERROR;
 
 	if (netreq->opt) {
@@ -866,12 +1009,10 @@ _udp_write(_stateless_upstream *self, getdns_network_req *netreq, uint64_t *now_
 		if (netreq->edns_maximum_udp_payload_size == -1)
 			gldns_write_uint16(netreq->opt + 3,
 			    ( netreq->max_udp_payload_size =
-			      addr->addr.ss_family == AF_INET6
-			    ? 1232 : 1432));
+			      addr->sa_family == AF_INET6 ? 1232 : 1432));
 	}
-	if (pkt_len != (written = sendto(
-	    netreq->fd, (const void *)netreq->query, (size_t)pkt_len, 0,
-	    (struct sockaddr *)&addr->addr, addr->addr_len))) {
+	if (pkt_len != (written = sendto(netreq->fd,
+	    (const void *)netreq->query, (size_t)pkt_len, 0, addr, addrlen))) {
 
 #if defined(STUB_DEBUG) && STUB_DEBUG
 		if (written == -1)
@@ -906,7 +1047,7 @@ _udp_write_cb(void *userarg)
 	DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_WRITE, 
 	             __FUNC__, (void *)netreq);
 
-	if (_udp_write(udp_up(netreq->gup.current), netreq, &now_ms)) {
+	if (_udp_write(as_udp_up(netreq->gup.current), netreq, &now_ms)) {
 		_udp_revoke(netreq->gup.current, netreq);
 		_udp_erred(netreq->gup.current);
 		_fallback_resubmit_netreq(netreq, &now_ms);
@@ -917,7 +1058,10 @@ int
 _udp_submit(_getdns_upstream *self_up,
     getdns_network_req *netreq, uint64_t *now_ms)
 {
-	_stateless_upstream *self = udp_up(self_up);
+	_stateless_upstream   *self = as_udp_up(self_up);
+	socklen_t              addrlen;
+	const struct sockaddr *addr = UPSTREAM_GET_ADDR(self_up, &addrlen);
+
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
 	           (void*)netreq, netreq->request_type);
 
@@ -925,7 +1069,10 @@ _udp_submit(_getdns_upstream *self_up,
 	    ++self->to_retry <= 0)
 		return STUB_TRY_NEXT_UPSTREAM;
 
-	netreq->fd = socket(addr_up(self_up)->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (!addr)
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	netreq->fd = socket(addr->sa_family, SOCK_DGRAM, IPPROTO_UDP);
 	if (netreq->fd < 0)
 		return _getdns_resource_depletion()
 		     ? STUB_TRY_AGAIN_LATER
@@ -952,7 +1099,7 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 
 	/* Find upstream for current transport */
 	while ((up = netreq_next_upstream(netreq))) {
-		switch (up->vmt->submit(up, netreq, now_ms)) {
+		switch (UPSTREAM_SUBMIT(up, netreq, now_ms)) {
 		case GETDNS_RETURN_GOOD:
 			return GETDNS_RETURN_GOOD;
 
@@ -969,7 +1116,7 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 
 		default:
 			/* Not submitted, so no revoke needed */
-			up->vmt->erred(up);
+			UPSTREAM_ERRED(up);
 			break;
 		}
 	}
@@ -982,7 +1129,7 @@ _getdns_cancel_stub_request(getdns_network_req *netreq)
 	DEBUG_STUB("%s %-35s: MSG: %p\n",
 	           STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
 	if (netreq->gup.current)
-		netreq->gup.current->vmt->revoke(netreq->gup.current, netreq);
+		UPSTREAM_REVOKE(netreq->gup.current, netreq);
 	else	_udp_revoke(NULL, netreq);
 	_getdns_netreq_change_state(netreq, NET_REQ_CANCELED);
 	netreq->debug_end_time = _getdns_get_time_as_uintt64();
@@ -998,22 +1145,27 @@ static void _nop_cleanup(_getdns_upstream *self)
 { (void)self; }
 static void _nop_uint32_t(_getdns_upstream *self, uint32_t n)
 { (void)self; (void)n; }
+static const struct sockaddr *
+_nop_get_addr(_getdns_upstream *self, socklen_t *addrlen)
+{ (void)self; (void)addrlen; return NULL; }
 static getdns_return_t _nop_as_dict(
     _getdns_upstream *self, getdns_dict **dict_r)
 { (void)self; (void)dict_r; return GETDNS_RETURN_NOT_IMPLEMENTED; }
-static const char *_nop_transport_name(_getdns_upstream *self)
+static const char *_nop_get_transport_name(_getdns_upstream *self)
 { (void)self; return "<NO TRANSPORT>"; }
+static const char *_nop_get_name(_getdns_upstream *self)
+{ (void)self; return "<NO NAME>"; }
+
 
 static int _nop_submit(
     _getdns_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
 { (void)self; (void)netreq; (void)now_ms
-; fprintf(stderr, "Submit netreq %p with transport %s on upstream %p\n", (void *)netreq, self->vmt->transport_name(self), (void *)self)
+; fprintf(stderr, "Submit netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self))
 ; return GETDNS_RETURN_NOT_IMPLEMENTED; }
-
 static void _nop_revoke(_getdns_upstream *self, getdns_network_req *netreq)
-{ (void)self; (void)netreq; ; fprintf(stderr, "Revoke netreq %p with transport %s on upstream %p\n", (void *)netreq, self->vmt->transport_name(self), (void *)self); }
+{ (void)self; (void)netreq; ; fprintf(stderr, "Revoke netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self)); }
 static void _nop_erred(_getdns_upstream *self)
-{ (void)self; fprintf(stderr, "Upstream %p with transport %s erred\n", (void *)self, self->vmt->transport_name(self)); }
+{ (void)self; fprintf(stderr, "Upstream %p for %s with transport %s erred\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
 
 static void _set_parent_port(_getdns_upstream *self, uint32_t port)
 {
@@ -1029,13 +1181,21 @@ static void _set_parent_tls_port(_getdns_upstream *self, uint32_t port)
 		self->parent->vmt->set_tls_port(self->parent, port);
 }
 
-static const char *_udp_transport_name(_getdns_upstream *self)
+static const struct sockaddr *
+_get_parent_addr(_getdns_upstream *self, socklen_t *len)
+{ return self && self->parent ? UPSTREAM_GET_ADDR(self->parent, len) : NULL; }
+
+static const char *_get_parent_name(_getdns_upstream *self)
+{ return self && self->parent
+       ? UPSTREAM_GET_NAME(self->parent) : "<NO PARENT NAME>"; }
+
+static const char *_udp_get_transport_name(_getdns_upstream *self)
 { (void)self; return "UDP"; }
 
-static const char *_tcp_transport_name(_getdns_upstream *self)
+static const char *_tcp_get_transport_name(_getdns_upstream *self)
 { (void)self; return "TCP"; }
 
-static const char *_tls_transport_name(_getdns_upstream *self)
+static const char *_tls_get_transport_name(_getdns_upstream *self)
 { (void)self; return "TLS"; }
 
 static _getdns_upstream_vmt _base_vmt = {
@@ -1043,7 +1203,9 @@ static _getdns_upstream_vmt _base_vmt = {
 	_nop_uint32_t,
 	_nop_uint32_t,
 	_nop_as_dict,
-	_nop_transport_name,
+	_nop_get_name,
+	_nop_get_addr,
+	_nop_get_transport_name,
 
 	_nop_submit,
 	_nop_revoke,
@@ -1054,7 +1216,22 @@ static _getdns_upstream_vmt   _address_vmt = {
 	_address_set_port,
 	_address_set_tls_port,
 	_address_as_dict,
-	_nop_transport_name,
+	_address_get_name,
+	_address_get_addr,
+	_nop_get_transport_name,
+
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
+};
+static _getdns_upstream_vmt   _named_vmt = {
+	_named_cleanup,
+	_named_set_port,
+	_named_set_tls_port,
+	_named_as_dict,
+	_named_get_name,
+	_nop_get_addr,
+	_nop_get_transport_name,
 
 	_nop_submit,
 	_nop_revoke,
@@ -1065,7 +1242,9 @@ static _getdns_upstream_vmt       _udp_vmt = {
 	_set_parent_port,
 	_set_parent_tls_port,
 	_nop_as_dict,		/* Handled by _address parent */
-	_udp_transport_name,
+	_get_parent_name,
+	_get_parent_addr,
+	_udp_get_transport_name,
 
 	_udp_submit,
 	_udp_revoke,
@@ -1076,7 +1255,9 @@ static _getdns_upstream_vmt       _tcp_vmt = {
 	_set_parent_port,
 	_set_parent_tls_port,
 	_nop_as_dict,		/* Handled by _address parent */
-	_tcp_transport_name,
+	_get_parent_name,
+	_get_parent_addr,
+	_tcp_get_transport_name,
 
 	_nop_submit,
 	_nop_revoke,
@@ -1087,11 +1268,12 @@ static _getdns_upstream_vmt       _tls_vmt = {
 	_set_parent_port,
 	_set_parent_tls_port,
 	_nop_as_dict,		/* Handled by _address parent */
-	_tls_transport_name,
+	_get_parent_name,
+	_get_parent_addr,
+	_tls_get_transport_name,
 
 	_nop_submit,
 	_nop_revoke,
 	_nop_erred,
 };
-
 

@@ -33,6 +33,7 @@
 #define _GETDNS_UPSTREAMS_H_
 
 #include "getdns/getdns.h"
+#include "config.h"
 
 typedef struct getdns_network_req getdns_network_req;
 typedef uint16_t upstream_caps;
@@ -83,13 +84,28 @@ static inline int _upstream_cap_complies(upstream_caps req, upstream_caps cap)
 /*---------------------------------------------------------------------------*/
 
 
+#define UPSTREAM_CLEANUP(UP)            ((UP)->vmt->cleanup((UP)))
+#define UPSTREAM_AS_DICT(UP, DICT_R)    ((UP)->vmt->as_dict((UP), (DICT_R)))
+#define UPSTREAM_GET_NAME(UP)           ((UP)->vmt->get_name((UP)))
+#define UPSTREAM_GET_ADDR(UP, LEN_R)    ((UP)->vmt->get_addr((UP), (LEN_R)))
+#define UPSTREAM_GET_TRANSPORT_NAME(UP) ((UP)->vmt->get_transport_name((UP)))
+
+#define UPSTREAM_SUBMIT(UP, NETREQ, MS) ((UP)->vmt->submit((UP), (NETREQ), (MS)))
+#define UPSTREAM_REVOKE(UP, NETREQ)     ((UP)->vmt->revoke((UP), (NETREQ)))
+#define UPSTREAM_ERRED(UP)              ((UP)->vmt->erred((UP)))
+
 typedef struct _getdns_upstream _getdns_upstream;
 typedef const struct _getdns_upstream_vmt {
 	void            (*cleanup)(_getdns_upstream *self);
 	void            (*set_port)(_getdns_upstream *self, uint32_t);
 	void            (*set_tls_port)(_getdns_upstream *self, uint32_t);
+
 	getdns_return_t (*as_dict)(_getdns_upstream *s, getdns_dict **dict_r);
-	const char *    (*transport_name)(_getdns_upstream *self);
+
+	const char *    (*get_name)(_getdns_upstream *self);
+	const struct sockaddr *
+	                (*get_addr)(_getdns_upstream *self, socklen_t *len);
+	const char *    (*get_transport_name)(_getdns_upstream *self);
 
 	/* submit() is called by _getdns_submit_stub_request()
 	 * submit() returns:
