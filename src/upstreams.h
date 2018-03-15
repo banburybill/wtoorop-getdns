@@ -143,7 +143,7 @@ struct _getdns_upstream {
 _getdns_upstream *_getdns_next_upstream(_getdns_upstream *current,
     upstream_caps cap, _getdns_upstream *stop_at);
 
-getdns_return_t _getdns_append_address_str_upstream(_getdns_upstream *parent,
+getdns_return_t _getdns_append_upstream(_getdns_upstream *parent,
     const char *addr_str, _getdns_upstream **new_upstream);
 
 /*---------------------------------------------------------------------------*/

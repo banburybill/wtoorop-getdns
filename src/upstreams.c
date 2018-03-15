@@ -610,18 +610,14 @@ static getdns_return_t _address_as_dict(
 	return GETDNS_RETURN_GOOD;
 }
 
-getdns_return_t
-_getdns_append_address_str_upstream(_getdns_upstream *parent,
+static getdns_return_t
+_getdns_append_address_upstream(_getdns_upstream *parent, struct addrinfo *ai,
     const char *addr_str, _getdns_upstream **new_upstream)
 {
-	struct mem_funcs  *mfs;
 	_address_upstream *up;
-	struct addrinfo    hints;
-	struct addrinfo   *ai = NULL;
-	int gai_r;
-
-	assert(parent);
-	assert(addr_str); /* contract for usage within library*/
+	struct mem_funcs  *mfs;
+	assert(ai);
+	assert(addr_str);
 
 	mfs = priv_getdns_context_mf(_up_context(parent));
 	assert(mfs); /* invariant of data-structure */
@@ -651,33 +647,38 @@ _getdns_append_address_str_upstream(_getdns_upstream *parent,
 	_tls_upstream_init(&up->tls);
 
 	(void) strlcpy(up->addr_str, addr_str, sizeof(up->addr_str));
-	(void) memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family    = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
-	hints.ai_flags     = AI_NUMERICHOST; /* No reverse name lookups */
-	if ((gai_r = getaddrinfo(addr_str, "53", &hints, &ai))) {
-		/* log("Could not convert %s to network address: \"%s\"\n",
-		 * gai_strerror(gai_r));
-		 */
-		(void)gai_r;
-		if (ai) freeaddrinfo(ai);
-		GETDNS_FREE(*mfs, up);
-		return GETDNS_RETURN_INVALID_PARAMETER;
-	}
-	if (!ai) {
-		/* log("Could not convert %s to network address: \"%s\"\n") */
-		GETDNS_FREE(*mfs, up);
-		return GETDNS_RETURN_INVALID_PARAMETER;
-	}
+
 	up->addr_len = ai->ai_addrlen;
 	(void) memcpy(&up->addr, ai->ai_addr, ai->ai_addrlen);
 	up->addr.ss_family = ai->ai_family;
 	up->tsig.tsig_alg = GETDNS_NO_TSIG;
 
 	_upstream_append(parent, &up->super);
-
-	if (new_upstream)
-		*new_upstream = &up->super;
 	return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t
+_getdns_append_upstream(_getdns_upstream *parent,
+    const char *addr_str, _getdns_upstream **new_upstream)
+{
+	struct addrinfo  hints;
+	struct addrinfo *ai = NULL;
+	getdns_return_t  r;
+
+	assert(parent);
+	assert(addr_str); /* contract for usage within library*/
+
+	(void) memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family    = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
+	hints.ai_flags     = AI_NUMERICHOST; /* No reverse name lookups */
+	if (getaddrinfo(addr_str, "53", &hints, &ai) || !ai) {
+		/* named upstream */
+		return GETDNS_RETURN_NOT_IMPLEMENTED;
+	}
+	r = _getdns_append_address_upstream(
+	    parent, ai, addr_str, new_upstream);
+	freeaddrinfo(ai);
+	return r;
 }
 
 static _address_upstream *addr_up(_getdns_upstream *up)
