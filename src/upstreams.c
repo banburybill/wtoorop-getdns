@@ -84,9 +84,11 @@ static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_
 static _getdns_upstream_vmt      _base_vmt;
 static _getdns_upstream_vmt   _address_vmt;
 static _getdns_upstream_vmt     _named_vmt;
+static _getdns_upstream_vmt   _doh_uri_vmt;
 static _getdns_upstream_vmt       _udp_vmt;
 static _getdns_upstream_vmt       _tcp_vmt;
 static _getdns_upstream_vmt       _tls_vmt;
+static _getdns_upstream_vmt       _doh_vmt;
 
 /* Functions for _getdns_upstreams 
  *****************************************************************************/
@@ -503,13 +505,61 @@ _tls_upstream_init(_tls_upstream *up)
 static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
 { return up && up->vmt == &_tls_vmt ? (_tls_upstream *)up : NULL; }
 
-typedef struct _tsig_st {
-	uint8_t          tsig_dname[256];
-	size_t           tsig_dname_len;
-	size_t           tsig_size;
-	uint8_t          tsig_key[256];
-	getdns_tsig_algo tsig_alg;
-} _tsig_st;
+typedef struct _doh_upstream {
+	_tls_upstream super;
+	
+	/* settings */
+	socklen_t                addr_len;
+	struct sockaddr_storage  addr;
+	char                     uri[4096];
+
+	_tsig_st                 tsig;
+} _doh_upstream;
+
+static inline _doh_upstream *as_doh_up(_getdns_upstream *up)
+{ return up && up->vmt == &_doh_vmt ? (_doh_upstream *)up : NULL; }
+
+static void _doh_cleanup(_getdns_upstream *self_up)
+{
+	struct mem_funcs  *mfs;
+
+	if ((mfs = priv_getdns_context_mf(_up_context(self_up)))) {
+		GETDNS_FREE(*mfs, self_up);
+	}
+}
+
+static const struct sockaddr *
+_doh_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
+{
+	_doh_upstream *self = as_doh_up(self_up);
+
+	if (self) {
+		if (addrlen) *addrlen = self->addr_len;
+		return (struct sockaddr *)&self->addr;
+	}
+	return NULL;
+}
+
+static const char *
+_doh_get_name(_getdns_upstream *self_up)
+{
+	_doh_upstream *self = as_doh_up(self_up);
+	return self ? self->uri : NULL;
+}
+
+static void _doh_set_port(_getdns_upstream *self_up, uint32_t port)
+{
+	_doh_upstream *self = as_doh_up(self_up);
+
+	if (!self)
+		; /* pass */
+
+	else if (self->addr.ss_family == AF_INET)
+		((struct sockaddr_in *)(&self->addr))->sin_port = htons(port);
+
+	else if (self->addr.ss_family == AF_INET6)
+		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
+}
 
 typedef struct _address_upstream {
 	_getdns_upstream         super;
@@ -720,7 +770,8 @@ typedef struct _named_upstream {
 } _named_upstream;
 
 static inline _named_upstream *as_named_up(_getdns_upstream *up)
-{ return up && up->vmt == &_named_vmt ? (_named_upstream *)up : NULL; }
+{ return up && (  up->vmt == &_named_vmt
+               || up->vmt == &_doh_uri_vmt) ? (_named_upstream *)up : NULL; }
 
 static void netreq_fifo_add(
     getdns_network_req **fifo, getdns_network_req **fifo_last,
@@ -769,6 +820,52 @@ static void netreq_fifo_remove(
 	}
 }
 
+typedef struct _doh_uri_upstream {
+	_named_upstream super;
+	
+	/* Settings */
+	char            uri[4096];
+	char           *path;
+} _doh_uri_upstream;
+
+static inline _doh_uri_upstream *as_doh_uri_up(_getdns_upstream *up)
+{ return up && up->vmt == &_doh_uri_vmt ? (_doh_uri_upstream *)up : NULL; }
+
+static getdns_return_t
+_getdns_append_doh_upstream(_getdns_upstream *parent_up,
+    struct addrinfo *ai, const char *addr_str, _getdns_upstream **new_upstream)
+{
+	_doh_uri_upstream *parent = as_doh_uri_up(parent_up);
+	struct mem_funcs *mfs = priv_getdns_context_mf(_up_context(parent_up));
+	_doh_upstream *up;
+
+	assert(ai);
+	assert(addr_str);
+
+	if (!parent || !mfs)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!(up = GETDNS_MALLOC(*mfs, _doh_upstream)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	(void) memset(up, 0, sizeof(*up));
+	_tls_upstream_init(&up->super);
+	up->super.tls_port = 443;
+	up->super.super.super.vmt = &_doh_vmt;
+	(void)snprintf(up->uri, sizeof(up->uri),
+	    "https://%s/%s", addr_str, parent->path);
+
+	up->addr_len = ai->ai_addrlen;
+	(void) memcpy(&up->addr, ai->ai_addr, ai->ai_addrlen);
+	up->addr.ss_family = ai->ai_family;
+	up->tsig.tsig_alg = GETDNS_NO_TSIG;
+
+	_upstream_append(parent_up, &up->super.super.super);
+	if (new_upstream)
+		*new_upstream = &up->super.super.super;
+	return GETDNS_RETURN_GOOD;
+}
+
 static void _named_address_answer_cb(
     _named_upstream *self, getdns_network_req **netreq,
     size_t addrlen, int af)
@@ -793,10 +890,25 @@ static void _named_address_answer_cb(
 		 if (rr->rr_i.nxt - rr->rr_i.rr_type != (int)(10 + addrlen))
 			 continue;
 		(void) inet_ntop(af, rr->rr_i.rr_type + 10, a_buf, sizeof(a_buf));
-		fprintf(stderr, "Address lookup: %s\n", a_buf);
+		fprintf(stderr, "Address lookup (for DoH): %s\n", a_buf);
 
 		/* TODO: Replace this with pass in native address data */
-		if (!_getdns_append_upstream(&self->super, a_buf, &new_upstream)) {
+		if (self->super.vmt == &_doh_uri_vmt) {
+			struct addrinfo   hints;
+			struct addrinfo  *ai = NULL;
+
+			(void) memset(&hints, 0, sizeof(struct addrinfo));
+			hints.ai_family    = AF_UNSPEC;      /* IPv4 or IPv6 */
+			hints.ai_flags     = AI_NUMERICHOST; /* No reverse lookups */
+
+			if (!getaddrinfo(a_buf, "443", &hints, &ai) &&
+			    !_getdns_append_doh_upstream(
+					&self->super, ai, a_buf, &new_upstream) &&
+			    self->port != 443)
+				new_upstream->vmt->set_port(new_upstream, self->port);
+
+		} else if (!_getdns_append_upstream(
+		    &self->super, a_buf, &new_upstream)) {
 			if (self->port != 53)
 				new_upstream->vmt->set_port(new_upstream, self->port);
 			if (self->tls_port != 853)
@@ -848,6 +960,8 @@ static int _named_submit(
 	getdns_context *context = NULL;
 	_named_upstream *self = as_named_up(self_up);
 
+	(void)now_ms;
+
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
 	           (void*)netreq, netreq->request_type);
 
@@ -858,8 +972,12 @@ static int _named_submit(
 		/* Schedule AAAA request */
 		self->done_aaaa = 1;
 		if (!context)
-			context = _up_context(self_up);
+			context = _getdns_context_get_sys_ctxt(
+			    _up_context(self_up), netreq->owner->loop);
 
+		/* TODO: Allow query with alternative transport list
+		 * intead of using sys_ctxt
+		 */
 		if (context && (r = _getdns_general_loop(context,
 		    netreq->owner->loop, self->name, GETDNS_RRTYPE_AAAA,
 		    want_cap_resolved, self, &self->req_aaaa, NULL,
@@ -870,8 +988,12 @@ static int _named_submit(
 		/* Schedule A request */
 		self->done_a = 1;
 		if (!context)
-			context = _up_context(self_up);
+			context = _getdns_context_get_sys_ctxt(
+			    _up_context(self_up), netreq->owner->loop);
 
+		/* TODO: Allow query with alternative transport list
+		 * intead of using sys_ctxt
+		 */
 		if (context && (r = _getdns_general_loop(context,
 		    netreq->owner->loop, self->name, GETDNS_RRTYPE_A,
 		    want_cap_resolved, self, &self->req_a, NULL,
@@ -975,15 +1097,10 @@ static const char *_named_get_name(_getdns_upstream *self_up)
 	return self ? self->name : "<NO NAME>";
 }
 
-static getdns_return_t
-_getdns_create_named_upstream(struct mem_funcs *mfs,
-    const char *name, _getdns_upstream **new_upstream)
+
+static void
+_named_upstream_init(_named_upstream *up, const char *name)
 {
-	_named_upstream *up;
-
-	if (!(up = GETDNS_MALLOC(*mfs, _named_upstream)))
-		return GETDNS_RETURN_MEMORY_ERROR;
-
 	(void) memset(up, 0, sizeof(*up));
 	up->super.vmt = &_named_vmt;
 	up->super.may = (CAP_MIGHT     & (CAP_RESOLVED ^ 0xFFFF))
@@ -993,12 +1110,87 @@ _getdns_create_named_upstream(struct mem_funcs *mfs,
 	(void) strlcpy(up->name, name, sizeof(up->name));
 	up->port = 53;
 	up->tls_port = 853;
+}
+
+static getdns_return_t
+_getdns_create_named_upstream(struct mem_funcs *mfs,
+    const char *name, _getdns_upstream **new_upstream)
+{
+	_named_upstream *up;
+
+	if (!(up = GETDNS_MALLOC(*mfs, _named_upstream)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	_named_upstream_init(up, name);
 
 	if (new_upstream)
 		*new_upstream = &up->super;
 
 	return GETDNS_RETURN_GOOD;
 }
+
+static getdns_return_t
+_getdns_create_doh_uri_upstream(struct mem_funcs *mfs,
+    const char *uri, _getdns_upstream **new_upstream)
+{
+	_doh_uri_upstream *up;
+
+	if (!(up = GETDNS_MALLOC(*mfs, _doh_uri_upstream)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	(void) strlcpy(up->uri, uri, sizeof(up->uri));
+	if (strlen(up->uri) > 8) {
+		/* TODO: https on different port */
+		char *slash = strchr(up->uri + 8, '/');
+
+		if (slash) {
+			*slash = '\0';
+			up->path = slash + 1;
+		} else {
+			up->path = up->uri + strlen(up->uri);
+		}
+		_named_upstream_init(&up->super, up->uri + 8);
+		if (slash) *slash = '/';
+	} else {
+		GETDNS_FREE(*mfs, up);
+		return GETDNS_RETURN_INVALID_PARAMETER;
+	}
+	up->super.super.vmt = &_doh_uri_vmt;
+	up->super.tls_port = 443;
+	if (new_upstream)
+		*new_upstream = &up->super.super;
+
+	return GETDNS_RETURN_GOOD;
+}
+
+static getdns_return_t _doh_uri_as_dict(
+    _getdns_upstream *self_up, getdns_dict **dict_r)
+{
+	_doh_uri_upstream *self = as_doh_uri_up(self_up);
+	getdns_dict *dict = NULL;
+	getdns_return_t r = GETDNS_RETURN_GOOD;
+
+	if (!self)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!(dict = getdns_dict_create_with_context(_up_context(self_up))))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	if ((r = getdns_dict_util_set_string(dict, "uri", self->uri)))
+		; /* error */
+	else {
+		*dict_r = dict;
+		return GETDNS_RETURN_GOOD;
+	}
+	getdns_dict_destroy(dict);
+	return r;
+}
+
+static const char *_doh_uri_get_name(_getdns_upstream *self_up)
+{ _doh_uri_upstream *self = as_doh_uri_up(self_up); return self->uri; }
+
+static const char *_doh_get_transport_name(_getdns_upstream *self_up)
+{ (void)self_up; return "HTTPS"; }
 
 getdns_return_t
 _getdns_append_upstream(_getdns_upstream *parent,
@@ -1021,9 +1213,18 @@ _getdns_append_upstream(_getdns_upstream *parent,
 	hints.ai_family    = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
 	hints.ai_flags     = AI_NUMERICHOST; /* No reverse name lookups */
 
-	if (getaddrinfo(addr_str, "53", &hints, &ai) || !ai)
-		r = _getdns_create_named_upstream(mfs, addr_str, &up);
-	else
+	if (getaddrinfo(addr_str, "53", &hints, &ai) || !ai) {
+		if ((addr_str[0] == 'h' || addr_str[0] == 'H') &&
+		    (addr_str[1] == 't' || addr_str[1] == 'T') &&
+		    (addr_str[2] == 't' || addr_str[2] == 'T') &&
+		    (addr_str[3] == 'p' || addr_str[3] == 'P') &&
+		    (addr_str[4] == 's' || addr_str[4] == 'S') &&
+		     addr_str[5] == ':' &&
+		     addr_str[6] == '/' && addr_str[7] == '/')
+			r = _getdns_create_doh_uri_upstream(mfs, addr_str, &up);
+		else
+			r = _getdns_create_named_upstream(mfs, addr_str, &up);
+	} else
 		r = _getdns_create_address_upstream(mfs, ai, addr_str, &up);
 	freeaddrinfo(ai);
 	if (r)
@@ -1065,7 +1266,7 @@ ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
 				return -1;
 		}
 	}
-	if (!tsig || tsig->tsig_alg == GETDNS_NO_TSIG)
+	if (!tsig || tsig->tsig_alg == GETDNS_NO_TSIG_)
 		return netreq->response - netreq->query;
 
 	return -1; /* TODO: Add tsig option */
@@ -1443,6 +1644,19 @@ static _getdns_upstream_vmt   _named_vmt = {
 	_named_revoke,
 	_named_erred,
 };
+static _getdns_upstream_vmt   _doh_uri_vmt = {
+	_named_cleanup,
+	_named_set_port,
+	_named_set_port,
+	_doh_uri_as_dict,
+	_doh_uri_get_name,
+	_nop_get_addr,
+	_doh_get_transport_name,
+
+	_named_submit,
+	_named_revoke,
+	_named_erred,
+};
 static _getdns_upstream_vmt       _udp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
 	_set_parent_port,
@@ -1482,4 +1696,16 @@ static _getdns_upstream_vmt       _tls_vmt = {
 	_nop_revoke,
 	_nop_erred,
 };
+static _getdns_upstream_vmt       _doh_vmt = {
+	_doh_cleanup,
+	_doh_set_port,
+	_doh_set_port,
+	_nop_as_dict,		/* Handled by _doh_uri_parent */
+	_doh_get_name,
+	_doh_get_addr,
+	_doh_get_transport_name,
 
+	_nop_submit,
+	_nop_revoke,
+	_nop_erred,
+};

@@ -2962,7 +2962,9 @@ getdns_context_set_upstream_recursive_servers(getdns_context *context,
 			if ((r = getdns_dict_get_bindata(
 			    dict, "address_data", &address_data))) {
 				if ((r = getdns_dict_get_bindata(
-				    dict, "name", &name)))
+				    dict, "name", &name)) &&
+				    (r = getdns_dict_get_bindata(
+				    dict, "uri", &name)))
 					goto error;
 				else
 					assert(name);

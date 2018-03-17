@@ -634,7 +634,9 @@ getdns_return_t parse_args(int argc, char **argv)
 			else if ((r = getdns_dict_get_bindata(
 			    upstream, "address_data", &address)) &&
 			    (r = getdns_dict_get_bindata(
-			    upstream, "name", &address))) {
+			    upstream, "name", &address)) &&
+			    (r = getdns_dict_get_bindata(
+			    upstream, "uri", &address))) {
 
 				fprintf(stderr, "\"%s\" did not translate to "
 				    "an IP dict: %s\n", arg + 1,

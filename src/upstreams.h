@@ -198,5 +198,23 @@ _getdns_upstream *upstream_iter_init(upstream_iter *iter,
 
 _getdns_upstream *upstream_iter_next(upstream_iter *iter);
 
+typedef enum getdns_tsig_algo_ {
+        GETDNS_NO_TSIG_     = 0, /* Do not use tsig */
+        GETDNS_HMAC_MD5_    = 1, /* 128 bits */
+        GETDNS_GSS_TSIG_    = 2, /* Not supported */
+        GETDNS_HMAC_SHA1_   = 3, /* 160 bits */
+        GETDNS_HMAC_SHA224_ = 4,
+        GETDNS_HMAC_SHA256_ = 5,
+        GETDNS_HMAC_SHA384_ = 6,
+        GETDNS_HMAC_SHA512_ = 7
+} getdns_tsig_algo_;
+
+typedef struct _tsig_st {
+	uint8_t           tsig_dname[256];
+	size_t            tsig_dname_len;
+	size_t            tsig_size;
+	uint8_t           tsig_key[256];
+	getdns_tsig_algo_ tsig_alg;
+} _tsig_st;
 
 #endif /* _GETDNS_UPSTREAMS_H_ */

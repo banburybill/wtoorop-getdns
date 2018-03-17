@@ -1088,6 +1088,10 @@ _getdns_ipaddr_dict_mf(struct mem_funcs *mf, const char *ipstr)
 
 	if (!r) return NULL;
 
+	if (strncasecmp(ipstr, "https://", 8) == 0) {
+		getdns_dict_util_set_string(r, "uri", ipstr);
+		return r;
+	}
 	if (*ipstr == '[') {
 		char *br = strchr(ipstr, ']');
 		if (br) {
