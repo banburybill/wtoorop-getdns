@@ -63,6 +63,9 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms);
 
 static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_ms)
 {
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+	           (void*)netreq, netreq->request_type);
+
 	if (_getdns_submit_stub_request(netreq, now_ms) == GETDNS_RETURN_GOOD)
 		return; /* netreq still in flight */
 
@@ -312,6 +315,8 @@ static _getdns_upstream *netreq_next_upstream(getdns_network_req *netreq)
 		default                  : cap = 0;
 		                           break;
 		}
+		if (netreq->owner->want_cap_resolved)
+			cap |= CAP_RESOLVED;
 
 		if ((up = upstream_iter_init(
 		    &netreq->gup, &netreq->owner->context->gups, cap)))
@@ -714,6 +719,9 @@ typedef struct _named_upstream {
 	unsigned int             done_aaaa: 1;
 } _named_upstream;
 
+static inline _named_upstream *as_named_up(_getdns_upstream *up)
+{ return up && up->vmt == &_named_vmt ? (_named_upstream *)up : NULL; }
+
 static void netreq_fifo_add(
     getdns_network_req **fifo, getdns_network_req **fifo_last,
     getdns_network_req *netreq)
@@ -761,26 +769,119 @@ static void netreq_fifo_remove(
 	}
 }
 
+static void _named_address_answer_cb(
+    _named_upstream *self, getdns_network_req **netreq,
+    size_t addrlen, int af)
+{
+	_getdns_rrset_spc    rrset_spc;
+	_getdns_rrset       *rrset;
+	_getdns_rrtype_iter  rr_spc;
+	_getdns_rrtype_iter *rr;
+	char                 a_buf[40];
+
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+	           (void*)*netreq, (*netreq)->request_type);
+
+	if (!(rrset = _getdns_rrset_answer(&rrset_spc,
+	    (*netreq)->response, (*netreq)->response_len)))
+		; /* pass; maybe NXDOMAIN */
+
+	else for ( rr = _getdns_rrtype_iter_init(&rr_spc, rrset)
+	         ; rr ; rr = _getdns_rrtype_iter_next(rr)) {
+		_getdns_upstream *new_upstream;
+
+		 if (rr->rr_i.nxt - rr->rr_i.rr_type != (int)(10 + addrlen))
+			 continue;
+		(void) inet_ntop(af, rr->rr_i.rr_type + 10, a_buf, sizeof(a_buf));
+		fprintf(stderr, "Address lookup: %s\n", a_buf);
+
+		/* TODO: Replace this with pass in native address data */
+		if (!_getdns_append_upstream(&self->super, a_buf, &new_upstream)) {
+			if (self->port != 53)
+				new_upstream->vmt->set_port(new_upstream, self->port);
+			if (self->tls_port != 853)
+				new_upstream->vmt->set_tls_port(
+				    new_upstream, self->tls_port);
+		}
+	}
+	*netreq = NULL;
+
+	/* If all lookups are done, remove capabilities,
+	 * so no new queries will be queued.
+	 */
+	if (self->done_a && !self->req_a && self->done_aaaa && !self->req_aaaa)
+		self->super.may  = 0;
+
+	/* Resubmit queued children */
+	if (self->super.children) {
+		getdns_network_req *req = self->fifo;
+		uint64_t now_ms = 0;
+
+		self->fifo = self->fifo_last = NULL;
+		while (req) {
+			getdns_network_req *next = req->write_queue_tail;
+			req->write_queue_tail = NULL;
+
+			_fallback_resubmit_netreq(req, &now_ms);
+
+			req = next;
+		}
+	}
+}
+
+static void _named_a_answer_cb(getdns_dns_req *dnsreq)
+{
+	_named_upstream     *self = (_named_upstream *)dnsreq->user_pointer;
+	_named_address_answer_cb(self, &self->req_a, 4, AF_INET);
+}
+
+static void _named_aaaa_answer_cb(getdns_dns_req *dnsreq)
+{
+	_named_upstream     *self = (_named_upstream *)dnsreq->user_pointer;
+	_named_address_answer_cb(self, &self->req_aaaa, 16, AF_INET6);
+}
+
 static int _named_submit(
     _getdns_upstream *self_up, getdns_network_req *netreq, uint64_t *now_ms)
 {
+	getdns_return_t r;
+	getdns_context *context = NULL;
 	_named_upstream *self = as_named_up(self_up);
+
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+	           (void*)netreq, netreq->request_type);
 
 	if (!self)
 		return STUB_TRY_NEXT_UPSTREAM;
 
+	if (!self->done_aaaa && !self->req_aaaa) {
+		/* Schedule AAAA request */
+		self->done_aaaa = 1;
+		if (!context)
+			context = _up_context(self_up);
+
+		if (context && (r = _getdns_general_loop(context,
+		    netreq->owner->loop, self->name, GETDNS_RRTYPE_AAAA,
+		    want_cap_resolved, self, &self->req_aaaa, NULL,
+		    _named_aaaa_answer_cb)))
+			(void)r; /* TODO: Log error */
+	}
 	if (!self->done_a && !self->req_a) {
 		/* Schedule A request */
 		self->done_a = 1;
+		if (!context)
+			context = _up_context(self_up);
 
-	}
-	if (!self->done_a && !self->req_aaaa) {
-		/* Schedule AAAA request */
-		self->done_aaaa = 1;
+		if (context && (r = _getdns_general_loop(context,
+		    netreq->owner->loop, self->name, GETDNS_RRTYPE_A,
+		    want_cap_resolved, self, &self->req_a, NULL,
+		    _named_a_answer_cb)))
+			(void)r; /* TODO: Log error */
 	}
 	if (self->req_a || self->req_aaaa) {
 		/* Append to fifo */
 		netreq_fifo_add(&self->fifo, &self->fifo_last, netreq);
+		/* TODO: Schedule timeout */
 		return GETDNS_RETURN_GOOD;
 	}
 	return STUB_TRY_NEXT_UPSTREAM;
@@ -804,9 +905,6 @@ static void _named_erred(_getdns_upstream *self_up)
 	/* _named_upstream *self = as_named_up(self_up); */
 	(void)(self_up);
 }
-
-static inline _named_upstream *as_named_up(_getdns_upstream *up)
-{ return up && up->vmt == &_named_vmt ? (_named_upstream *)up : NULL; }
 
 static void _named_cleanup(_getdns_upstream *self_up)
 {
