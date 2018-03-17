@@ -459,7 +459,9 @@ _tcp_upstream_init(_stateful_upstream *up)
 }
 
 static inline _stateful_upstream *as_tcp_up(_getdns_upstream *up)
-{ return up && up->vmt == &_tcp_vmt ? (_stateful_upstream *)up : NULL; }
+{ return up && (  up->vmt == &_tcp_vmt 
+               || up->vmt == &_tls_vmt
+               || up->vmt == &_doh_vmt ) ? (_stateful_upstream *)up : NULL; }
 
 typedef struct _tls_upstream {
 	_stateful_upstream super;
@@ -503,7 +505,8 @@ _tls_upstream_init(_tls_upstream *up)
 }
 
 static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
-{ return up && up->vmt == &_tls_vmt ? (_tls_upstream *)up : NULL; }
+{ return up && (  up->vmt == &_tls_vmt
+               || up->vmt == &_doh_vmt ) ? (_tls_upstream *)up : NULL; }
 
 typedef struct _doh_upstream {
 	_tls_upstream super;
