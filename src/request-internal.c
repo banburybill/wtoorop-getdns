@@ -91,6 +91,13 @@ getdns_dict  no_dnssec_checking_disabled_opportunistic_spc = {
 getdns_dict *no_dnssec_checking_disabled_opportunistic
     = &no_dnssec_checking_disabled_opportunistic_spc;
 
+getdns_dict  want_cap_resolved_spc = {
+	{ RBTREE_NULL, 0, (int (*)(const void *, const void *)) strcmp },
+	{ NULL, {{ NULL, NULL, NULL }}}
+};
+getdns_dict *want_cap_resolved = &want_cap_resolved_spc;
+
+
 static int
 is_extension_set(getdns_dict *extensions, const char *name, int default_value)
 {
@@ -101,7 +108,8 @@ is_extension_set(getdns_dict *extensions, const char *name, int default_value)
 	    || extensions == dnssec_ok_checking_disabled
 	    || extensions == dnssec_ok_checking_disabled_roadblock_avoidance
 	    || extensions == dnssec_ok_checking_disabled_avoid_roadblocks
-	    || extensions == no_dnssec_checking_disabled_opportunistic)
+	    || extensions == no_dnssec_checking_disabled_opportunistic
+	    || extensions == want_cap_resolved)
 		return 0;
 
 	r = getdns_dict_get_int(extensions, name, &value);
@@ -134,9 +142,9 @@ netreq_reset(getdns_network_req *net_req)
 	uint8_t *buf;
 	/* variables that need to be reset on reinit 
 	 */
-	// GUP {
+	// GUPS {
 	(void) memset(&net_req->gup, 0, sizeof(net_req->gup));
-	// } GUP
+	// } GUPS
 	net_req->first_upstream = NULL;
 	net_req->unbound_id = -1;
 	_getdns_netreq_change_state(net_req, NET_REQ_NOT_SENT);
@@ -742,7 +750,7 @@ _getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
 	    || dnssec_roadblock_avoidance
 #endif
 	    ;
-
+	int want_cap_resolved_ = (extensions == want_cap_resolved);
 	uint32_t edns_do_bit;
 	int      edns_maximum_udp_payload_size;
 	uint32_t get_edns_maximum_udp_payload_size;
@@ -794,7 +802,8 @@ _getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
 		opportunistic = 1;
 	} else if (extensions == dnssec_ok_checking_disabled ||
 	    extensions == dnssec_ok_checking_disabled_roadblock_avoidance ||
-	    extensions == dnssec_ok_checking_disabled_avoid_roadblocks)
+	    extensions == dnssec_ok_checking_disabled_avoid_roadblocks ||
+	    extensions == want_cap_resolved)
 		extensions = NULL;
 
 	have_add_opt_parameters = getdns_dict_get_dict(extensions,
@@ -1002,6 +1011,7 @@ _getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
 	result->is_dns_request = 1;
 	result->request_timed_out = 0;
 	result->chain = NULL;
+	result->want_cap_resolved = want_cap_resolved_;
 
 	network_req_init(result->netreqs[0], result,
 	    request_type, checking_disabled, opportunistic,

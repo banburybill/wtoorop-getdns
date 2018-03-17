@@ -46,9 +46,10 @@ typedef uint16_t upstream_caps;
 
 #define CAP_AUTHENTICATED     0x0010 /* Not initialized with CAP_MIGHT */
 #define CAP_MIGHT             0xFFE0
+#define CAP_RESOLVED          0x0020 /* Not with upstreams without address */
 
-#define CAP_OOOR              0x0020
-#define CAP_QNAME_MIN         0x0040
+#define CAP_OOOR              0x0040
+#define CAP_QNAME_MIN         0x0080
 
 #define CAP_EDNS0             0x0100
 #define CAP_KEEPALIVE         0x0200

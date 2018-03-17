@@ -698,13 +698,112 @@ _getdns_create_address_upstream(struct mem_funcs *mfs,
 typedef struct _named_upstream {
 	_getdns_upstream         super;
 	
+	/* Settings */
 	char                     name[1024];
-
 	uint16_t                 port;
 	uint16_t                 tls_port;
-
 	_tsig_st                 tsig;
+
+	/* State */
+	getdns_eventloop        *loop;
+	getdns_network_req      *req_a;
+	getdns_network_req      *req_aaaa;
+	getdns_network_req      *fifo;
+	getdns_network_req      *fifo_last;
+	unsigned int             done_a   : 1;
+	unsigned int             done_aaaa: 1;
 } _named_upstream;
+
+static void netreq_fifo_add(
+    getdns_network_req **fifo, getdns_network_req **fifo_last,
+    getdns_network_req *netreq)
+{
+	assert(fifo && fifo_last && netreq);
+
+	assert(netreq->write_queue_tail == NULL);
+	if (!*fifo) {
+		assert(!*fifo_last);
+		*fifo = *fifo_last = netreq;
+	} else {
+		(*fifo_last)->write_queue_tail = netreq;
+		 *fifo_last = netreq;
+	}
+}
+
+static void netreq_fifo_remove(
+    getdns_network_req **fifo, getdns_network_req **fifo_last,
+    getdns_network_req *netreq)
+{
+	getdns_network_req *r, *prev_r;
+
+	assert(fifo && fifo_last && netreq);
+
+	for ( r = *fifo, prev_r = NULL
+	    ; r ; prev_r = r, r = r->write_queue_tail) {
+		if (r != netreq)
+			continue;
+
+		/* netreq found */
+		if (prev_r)
+			prev_r->write_queue_tail = r->write_queue_tail;
+		else
+			*fifo = r->write_queue_tail;
+		
+		if (r == *fifo_last) {
+			/* If r was the last netreq,
+			 * its write_queue_tail MUST be NULL
+			 */
+			assert(r->write_queue_tail == NULL);
+			*fifo_last = prev_r;
+		}
+		netreq->write_queue_tail = NULL;
+		return;
+	}
+}
+
+static int _named_submit(
+    _getdns_upstream *self_up, getdns_network_req *netreq, uint64_t *now_ms)
+{
+	_named_upstream *self = as_named_up(self_up);
+
+	if (!self)
+		return STUB_TRY_NEXT_UPSTREAM;
+
+	if (!self->done_a && !self->req_a) {
+		/* Schedule A request */
+		self->done_a = 1;
+
+	}
+	if (!self->done_a && !self->req_aaaa) {
+		/* Schedule AAAA request */
+		self->done_aaaa = 1;
+	}
+	if (self->req_a || self->req_aaaa) {
+		/* Append to fifo */
+		netreq_fifo_add(&self->fifo, &self->fifo_last, netreq);
+		return GETDNS_RETURN_GOOD;
+	}
+	return STUB_TRY_NEXT_UPSTREAM;
+}
+
+static void _named_revoke(
+    _getdns_upstream *self_up, getdns_network_req *netreq)
+{
+	_named_upstream *self = as_named_up(self_up);
+	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
+
+	if (netreq && netreq->event.ev)
+		GETDNS_CLEAR_EVENT(netreq->owner->loop, &netreq->event);
+
+	if (self)
+		netreq_fifo_remove(&self->fifo, &self->fifo_last, netreq);
+}
+
+static void _named_erred(_getdns_upstream *self_up)
+{
+	/* _named_upstream *self = as_named_up(self_up); */
+	(void)(self_up);
+}
 
 static inline _named_upstream *as_named_up(_getdns_upstream *up)
 { return up && up->vmt == &_named_vmt ? (_named_upstream *)up : NULL; }
@@ -789,6 +888,9 @@ _getdns_create_named_upstream(struct mem_funcs *mfs,
 
 	(void) memset(up, 0, sizeof(*up));
 	up->super.vmt = &_named_vmt;
+	up->super.may = (CAP_MIGHT     & (CAP_RESOLVED ^ 0xFFFF))
+	              |  CAP_STATELESS |  CAP_UNENCRYPTED
+		      |  CAP_STATEFUL  |  CAP_ENCRYPTED;
 
 	(void) strlcpy(up->name, name, sizeof(up->name));
 	up->port = 53;
@@ -977,8 +1079,11 @@ _udp_read_cb(void *userarg)
 		if (up->n_responses % 100 == 1)
 			_getdns_context_log(_up_context(&up->super),
 			    GETDNS_LOG_UPSTREAM_STATS, GETDNS_LOG_INFO,
-			    "%-40s : Upstream   : UDP - Resps=%6d, Timeouts  =%6d (logged every 100 responses)\n",
-			    UPSTREAM_GET_NAME(&up->super), (int)up->n_responses, (int)up->n_timeouts);
+			    "%-40s : Upstream   : %s - Resps=%6d, Timeouts"
+			    "  =%6d (logged every 100 responses)\n",
+			    UPSTREAM_GET_NAME(&up->super),
+			    UPSTREAM_GET_TRANSPORT_NAME(&up->super),
+			    (int)up->n_responses, (int)up->n_timeouts);
 	}
 	_getdns_netreq_change_state(netreq, NET_REQ_FINISHED);
 	_getdns_check_dns_req_complete(dnsreq);
@@ -1064,6 +1169,9 @@ _udp_submit(_getdns_upstream *self_up,
 
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
 	           (void*)netreq, netreq->request_type);
+
+	if (!self)
+		return STUB_TRY_NEXT_UPSTREAM;
 
 	if (  self->to_retry <= 0 &&
 	    ++self->to_retry <= 0)
@@ -1233,9 +1341,9 @@ static _getdns_upstream_vmt   _named_vmt = {
 	_nop_get_addr,
 	_nop_get_transport_name,
 
-	_nop_submit,
-	_nop_revoke,
-	_nop_erred,
+	_named_submit,
+	_named_revoke,
+	_named_erred,
 };
 static _getdns_upstream_vmt       _udp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */

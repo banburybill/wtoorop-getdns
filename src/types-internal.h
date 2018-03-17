@@ -241,6 +241,15 @@ typedef struct getdns_network_req
 
 	/* Network requests scheduled to write after me
 	 * (head is on a stateful upstream)
+	 *
+	 * GUPS {
+	 *        Currently netreqs are queued on linked lists on upstreams.
+	 *        For example when waiting to be written on a upstream with
+	 *        a stateful transport.  At some point we'd like to change
+	 *        this and maintain queue's for specific transports.
+	 *        Upstreams with a specific transport that comes available,
+	 *        then must fetch the first netreq from those shared queues.
+	 * } GUPS
 	 */
 	struct getdns_network_req *write_queue_tail;
 
@@ -320,6 +329,9 @@ typedef struct getdns_dns_req {
 	unsigned return_call_reporting			: 1;
 	unsigned write_udp_immediately                  : 1;
 	unsigned add_warning_for_bad_dns		: 1;
+
+	/* Internally used for selecting resolved upstreams */
+	unsigned want_cap_resolved                      : 1;
 
 	/* Internally used by return_validation_chain */
 	unsigned dnssec_ok_checking_disabled		: 1;
@@ -435,6 +447,7 @@ extern getdns_dict *dnssec_ok_checking_disabled;
 extern getdns_dict *dnssec_ok_checking_disabled_roadblock_avoidance;
 extern getdns_dict *dnssec_ok_checking_disabled_avoid_roadblocks;
 extern getdns_dict *no_dnssec_checking_disabled_opportunistic;
+extern getdns_dict *want_cap_resolved;
 
 /* dns request utils */
 getdns_dns_req *_getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
