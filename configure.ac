@@ -873,6 +873,28 @@ then
 	fi
 fi
 
+my_with_libnghttp2=1
+AC_ARG_WITH(libnghttp2, AS_HELP_STRING([--with-libnghttp2=pathname],
+	[path to libnghttp2 (default: search /usr/local ..)]),
+	[], [withval="yes"])
+if test x_$withval = x_yes; then
+	for dir in /usr/local /opt/local /usr/pkg /usr/sfw; do
+		if test -f "$dir/include/nghttp2/nghttp2.h"; then
+			CFLAGS="$CFLAGS -I$dir/include"
+			LDFLAGS="$LDFLAGS -L$dir/lib"
+			AC_MSG_NOTICE([Found libnghttp2 in $dir])
+			break
+		fi
+	done
+else
+	if test x_$withval != x_no; then
+		CFLAGS="$CFLAGS -I$withval/include"
+		LDFLAGS="$LDFLAGS -L$withval/lib"
+	else
+		my_with_libnghttp2=0
+	fi
+fi
+
 # Checks for libraries.
 found_all_libs=1
 MISSING_DEPS=""
@@ -937,6 +959,20 @@ then
 		AC_CHECK_FUNCS([ub_ctx_set_stub])
 	], [
 		MISSING_DEPS="${MISSING_DEPS}${MISSING_SEP}libunbound"
+		MISSING_SEP=", "
+		found_all_libs=0
+	])
+fi
+
+if test $my_with_libnghttp2 = 1
+then
+	AC_CHECK_HEADERS([nghttp2/nghttp2.h],,, [AC_INCLUDES_DEFAULT])
+	AC_MSG_NOTICE([Checking for dependency libnghttp2])
+	AC_CHECK_LIB([nghttp2], [nghttp2_submit_request], [
+		AC_DEFINE_UNQUOTED([HAVE_LIBNGHTTP2], [1], [Define to 1 if you have the `nghttp2' library (-lnghttp2).]) dnl `
+		LIBS="-lnghttp2 $LIBS"
+	], [
+		MISSING_DEPS="${MISSING_DEPS}${MISSING_SEP}libnghttp2"
 		MISSING_SEP=", "
 		found_all_libs=0
 	])

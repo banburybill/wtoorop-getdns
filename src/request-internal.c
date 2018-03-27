@@ -122,6 +122,10 @@ network_req_cleanup(getdns_network_req *net_req)
 {
 	assert(net_req);
 
+	// GUPS {
+	if (net_req->gup.skip_bits)
+		GETDNS_FREE(net_req->owner->my_mf, net_req->gup.skip_bits);
+	// } GUPS
 	if (net_req->query_id_registered) {
 		(void) _getdns_rbtree_delete(
 		    net_req->query_id_registered, net_req->node.key);

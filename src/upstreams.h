@@ -36,6 +36,7 @@
 #include "config.h"
 
 typedef struct getdns_network_req getdns_network_req;
+struct mem_funcs;
 typedef uint16_t upstream_caps;
 
 #define CAP_STATELESS         0x0001
@@ -46,14 +47,15 @@ typedef uint16_t upstream_caps;
 
 #define CAP_AUTHENTICATED     0x0010 /* Not initialized with CAP_MIGHT */
 #define CAP_MIGHT             0xFFE0
-#define CAP_RESOLVED          0x0020 /* Not with upstreams without address */
+#define CAP_RESOLVED          0x0020 /* Upstream has IP address */
+#define CAP_CONNECTED         0x0040 /* Upstream is connected */
 
-#define CAP_OOOR              0x0040
-#define CAP_QNAME_MIN         0x0080
+#define CAP_OOOR              0x0080
+#define CAP_QNAME_MIN         0x0100
 
-#define CAP_EDNS0             0x0100
-#define CAP_KEEPALIVE         0x0200
-#define CAP_PADDING           0x0400
+#define CAP_EDNS0             0x0200
+#define CAP_KEEPALIVE         0x0400
+#define CAP_PADDING           0x0800
 
 #define CAP_DNSSEC_VALIDATION 0x1000
 #define CAP_DNSSEC_SIGS       0x2000
@@ -134,6 +136,7 @@ typedef const struct _getdns_upstream_vmt {
 
 	/* revoke() deregisters the netreq with the upstream.
 	 * This may involve:
+	 *   - Removing the netreq from waiting queues.
 	 *   - Removing the netreq from data structures within the upstream.
 	 *   - Closing sockets and freeing other resources.
 	 *   - Clearing or rescheduling I/O events.
@@ -148,6 +151,9 @@ typedef const struct _getdns_upstream_vmt {
 	void            (*erred)(_getdns_upstream *s);
 } _getdns_upstream_vmt;
 
+
+/* Upstream is the base class from which all upstream types inherit.
+ */
 struct _getdns_upstream {
         _getdns_upstream     *parent;
         _getdns_upstream     *children;
@@ -166,11 +172,33 @@ getdns_return_t _getdns_append_upstream(_getdns_upstream *parent,
 /*---------------------------------------------------------------------------*/
 
 
+typedef struct getdns_netreq_fifo {
+	getdns_network_req *head;
+	getdns_network_req *last;
+} getdns_netreq_fifo;
+
 typedef struct _getdns_upstreams {
-	_getdns_upstream  super;
-	getdns_context   *context;
-	/* current upstream for each statuful/encrypted/authenticated combi */
-	_getdns_upstream *current[CAP_TRANS + 1];
+	_getdns_upstream    super;
+	getdns_context     *context;
+
+	/* current upstream for each statefull/statless encrypted/unecrypted
+	 * combination. An upstream_iter will start (and stop) at this
+	 * upstream */
+	_getdns_upstream   *current[CAP_TRANS + 1];
+
+	/* Upstreams on a waiting queue, waiting for an upstream to finish
+	 * priming and pick it up */
+	getdns_netreq_fifo  waiting[CAP_TRANS + 1];
+
+	/* Number of upstreams looking at the waiting queue for the given
+	 * transport.  They could be resolving (in case of named upstreams),
+	 * connecting (in case of stateful upstreams), or could already be
+	 * connected, but currently busy with another request.
+	 *
+	 * If processing becomes 0 for a given transport, the queued netreqs
+	 * should be rescheduled (as long as at stays 0 of course).
+	 */
+	size_t              processing[CAP_TRANS + 1];
 } _getdns_upstreams;
 
 void _getdns_upstreams_init(
@@ -189,14 +217,33 @@ getdns_return_t _getdns_upstreams2list(
 
 typedef struct upstream_iter {
 	_getdns_upstream     *current;
-	upstream_caps cap;
+	upstream_caps         cap;
 	_getdns_upstream     *stop_at;
+	size_t                skip_sz;
+	uint8_t              *skip_bits;
 } upstream_iter;
 
 _getdns_upstream *upstream_iter_init(upstream_iter *iter,
     _getdns_upstreams *upstreams, upstream_caps cap);
 
 _getdns_upstream *upstream_iter_next(upstream_iter *iter);
+
+/* Mix13 from
+ * http://zimbry.blogspot.it/2011/09/better-bit-mixing-improving-on.html */
+static inline uint64_t bitmix64_hash(uint64_t x)
+{   x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+;   x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+; return x ^ (x >> 31); }
+
+static inline int upstream_visited(upstream_iter *i, _getdns_upstream *u)
+{ size_t bit; if (!i || !i->skip_sz || !u)  return 0
+; bit = (size_t)(bitmix64_hash((uint64_t)u) & (i->skip_sz - 1))
+; return i->skip_bits[bit >> 3] & (1 << (bit & 7)); }
+
+void upstream_set_visited(
+    struct mem_funcs *mfs, upstream_iter *i, _getdns_upstream *u);
+
+
 
 typedef enum getdns_tsig_algo_ {
         GETDNS_NO_TSIG_     = 0, /* Do not use tsig */

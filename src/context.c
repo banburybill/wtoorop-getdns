@@ -1806,6 +1806,9 @@ getdns_context_destroy(struct getdns_context *context)
 	 * might be an idle_timeout schedules, which will not get unscheduled
 	 * with cancel_outstanding_requests.
 	 */
+	// GUPS {
+	_getdns_upstreams_cleanup(&context->gups);
+	// } GUPS
 	_getdns_upstreams_dereference(context->upstreams);
 
 	context->sync_eventloop.loop.vmt->cleanup(&context->sync_eventloop.loop);
