@@ -480,25 +480,25 @@ remove_from_write_queue(getdns_upstream *upstream, getdns_network_req * netreq)
 
 	for ( r = upstream->write_queue, prev_r = NULL
 	    ; r
-	    ; prev_r = r, r = r->write_queue_tail) {
+	    ; prev_r = r, r = r->next) {
 
 		if (r != netreq)
 			continue;
 
 		if (prev_r)
-			prev_r->write_queue_tail = r->write_queue_tail;
+			prev_r->next = r->next ;
 		else
-			upstream->write_queue = r->write_queue_tail;
+			upstream->write_queue = r->next;
 
 		if (r == upstream->write_queue_last) {
 			/* If r was the last netreq,
 			 * its write_queue tail MUST be NULL
 			 */
-			assert(r->write_queue_tail == NULL);
+			assert(r->next == NULL);
 			upstream->write_queue_last = prev_r ? prev_r : NULL;
 		}
 
-		netreq->write_queue_tail = NULL;
+		netreq->next = NULL;
 		break; /* netreq found and removed */
 	}
 }
@@ -2427,7 +2427,7 @@ upstream_schedule_netreq(getdns_upstream *upstream, getdns_network_req *netreq)
 		 * prioritize this request (insert at 0)
 		 * and reschedule against synchronous loop.
 		 */
-		netreq->write_queue_tail = upstream->write_queue;
+		netreq->next = upstream->write_queue;
 		upstream->write_queue = netreq;
 		GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
 		upstream->loop = netreq->owner->loop;
@@ -2439,7 +2439,7 @@ upstream_schedule_netreq(getdns_upstream *upstream, getdns_network_req *netreq)
 		/* "Follow-up synchronous" or Asynchronous call,
 		 * this request comes last (append)
 		 */
-		upstream->write_queue_last->write_queue_tail = netreq;
+		upstream->write_queue_last->next = netreq;
 		upstream->write_queue_last = netreq;
 	}
 }

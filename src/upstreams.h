@@ -134,6 +134,17 @@ typedef const struct _getdns_upstream_vmt {
 	 */
 	int             (*submit)(_getdns_upstream *s, getdns_network_req *netreq, uint64_t *now_ms);
 
+	/* start() is called after a upstream is constructed and positioned in
+	 * the "upstreams" data-structure.  start() is for example run with
+	 * address upstreams that were constructed and inserted in the data-
+	 * structure as a result of address lookups (with named upstreams).
+	 *
+	 * When start is called, the upstream could take a peek at the waiting
+	 * queue for the transports it is serving, to see whether there are
+	 * network requests it could start processing.
+	 */
+	void            (*start)(_getdns_upstream *s, uint64_t *now_ms);
+
 	/* revoke() deregisters the netreq with the upstream.
 	 * This may involve:
 	 *   - Removing the netreq from waiting queues.

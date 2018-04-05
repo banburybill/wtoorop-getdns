@@ -251,7 +251,7 @@ typedef struct getdns_network_req
 	 *        then must fetch the first netreq from those shared queues.
 	 * } GUPS
 	 */
-	struct getdns_network_req *write_queue_tail;
+	struct getdns_network_req *next;
 
 	/* Some fields to record info for return_call_reporting */
 	uint64_t                debug_start_time;

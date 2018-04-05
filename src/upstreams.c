@@ -101,11 +101,32 @@ static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_
 	 * can be done from _getdns_netreq_change_state really.
 	 * When state is changed to something finite.
 	 */
+	assert(!netreq->event.ev);
 	_getdns_netreq_change_state(netreq, NET_REQ_ERRORED);
 	netreq->debug_end_time = _getdns_get_time_as_uintt64();
 	_getdns_check_dns_req_complete(netreq->owner);
 }
 
+static void upstream_cleanup_children(_getdns_upstream *self)
+{
+	_getdns_upstream *start, *current;
+
+	if (!self) return;
+
+	/* Just call cleanup on one layer in the hierarchy.
+	 * Individual upstreams are responsible for cleaning up their
+	 * children themselfs.
+	 */
+	if (!(start = current = self->children))
+		; /* pass */
+	else do {
+		_getdns_upstream *next = current->next;
+		UPSTREAM_CLEANUP(current);
+		current = next;
+	} while (current && current != start);
+
+	self->children = NULL;
+}
 
 /* Virtual Method Tables (initialized at end of file) */
 
@@ -157,28 +178,11 @@ _getdns_context_set_upstreams(getdns_context *context, _getdns_upstreams *upstre
 	} while (current && current != start);
 }
 
-
 void
 _getdns_upstreams_cleanup(_getdns_upstreams *upstreams)
 {
-	_getdns_upstream *start, *current;
-
-
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)upstreams);
-	assert(upstreams);
-	/* Just call cleanup on one layer in the hierarchy.
-	 * Individual upstreams are responsible for cleaning up their
-	 * children themselfs.
-	 */
-	if (!(start = current = upstreams->super.children))
-		; /* pass */
-	else do {
-		_getdns_upstream *next = current->next;
-		UPSTREAM_CLEANUP(current);
-		current = next;
-	} while (current && current != start);
-
-	upstreams->super.children = NULL;
+	upstream_cleanup_children(&upstreams->super);
 }
 
 getdns_return_t
@@ -217,42 +221,6 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 }
 
 static void
-decrement_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
-{
-	const upstream_caps *i;
-	uint64_t now_ms;
-
-	if (!ups)
-		return;
-
-	now_ms = 0;
-	for (i = all_trans_caps; *i; i++) {
-
-		if ((cap & *i) != *i)
-			continue;
-		assert(ups->processing[*i] > 0);
-		ups->processing[*i] -= 1;
-
-		/* Resubmit waiting netreqs when there are no longer upstreams
-		 * processing netreqs for this transport.
-		 */
-		while (ups->processing[*i] == 0) {
-			getdns_network_req *netreq = ups->waiting[*i].head;
-
-			if (!netreq)
-				break;
-
-			if ((ups->waiting[*i].head = netreq->write_queue_tail))
-				netreq->write_queue_tail = NULL;
-			else
-				ups->waiting[*i].last = NULL;
-
-			_fallback_resubmit_netreq(netreq, &now_ms);
-		}
-	}
-}
-
-static void
 increment_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
 {
 	const upstream_caps *i;
@@ -274,14 +242,14 @@ put_netreq_on_waiting_queue(getdns_network_req *netreq)
 	if (!netreq || !(ups = _up_upstreams(netreq->gup.current)))
 		return STUB_FATAL_ERROR;
 
-	assert(netreq->write_queue_tail == NULL);
+	assert(netreq->next == NULL);
 	fifo = &ups->waiting[netreq->gup.cap & CAP_TRANS];
 	if (!fifo->head) {
 		assert(!fifo->last);
 		fifo->head = fifo->last = netreq;
 	} else {
 		assert(fifo->last);
-		fifo->last->write_queue_tail = netreq;
+		fifo->last->next = netreq;
 		fifo->last = netreq;
 	}
 	return GETDNS_RETURN_GOOD;
@@ -308,25 +276,90 @@ revoke_netreq(getdns_network_req *netreq)
 
 	fifo = &ups->waiting[netreq->gup.cap & CAP_TRANS];
 	for ( r = fifo->head, prev_r = NULL
-	    ; r ; prev_r = r, r = r->write_queue_tail) {
+	    ; r ; prev_r = r, r = r->next) {
 		if (r != netreq)
 			continue;
 
 		/* netreq found */
 		if (prev_r)
-			prev_r->write_queue_tail = r->write_queue_tail;
+			prev_r->next = r->next;
 		else
-			fifo->head = r->write_queue_tail;
+			fifo->head = r->next;
 		
 		if (r == fifo->last) {
 			/* If r was the last netreq,
-			 * its write_queue_tail MUST be NULL
+			 * its next MUST be NULL
 			 */
-			assert(r->write_queue_tail == NULL);
+			assert(r->next == NULL);
 			fifo->last = prev_r;
 		}
-		netreq->write_queue_tail = NULL;
+		netreq->next = NULL;
 		return;
+	}
+}
+
+static void
+netreq_timeout_cb(void *userarg)
+{
+	getdns_network_req *netreq = (getdns_network_req *)userarg;
+
+	assert(netreq);
+	if (!netreq->gup.current)
+		revoke_netreq(netreq);
+	else {
+		UPSTREAM_REVOKE(netreq->gup.current, netreq);
+		UPSTREAM_ERRED(netreq->gup.current);
+	}
+	_getdns_netreq_change_state(netreq, NET_REQ_TIMED_OUT);
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
+	_getdns_check_dns_req_complete(netreq->owner);
+}
+
+static void
+decrement_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
+{
+	const upstream_caps *i;
+	uint64_t now_ms;
+
+	if (!ups)
+		return;
+
+	now_ms = 0;
+	for (i = all_trans_caps; *i; i++) {
+
+		if ((cap & *i) != *i)
+			continue;
+		assert(ups->processing[*i] > 0);
+		ups->processing[*i] -= 1;
+
+		/* Resubmit waiting netreqs when there are no longer upstreams
+		 * processing netreqs for this transport.
+		 */
+		while (ups->processing[*i] == 0) {
+			getdns_network_req *netreq = ups->waiting[*i].head;
+
+			if (!netreq)
+				break;
+
+			/* Revoke the netreq from the current upstream */
+			if (netreq->gup.current)
+				UPSTREAM_REVOKE(netreq->gup.current, netreq);
+			else
+				revoke_netreq(netreq);
+
+			/* Revokation should have removed it from the queue
+			 *
+			 * assert(ups->waiting[*i].head != netreq)
+			 */
+			if (ups->waiting[*i].head != netreq)
+				; /* pass */
+			else if ((ups->waiting[*i].head = netreq->next))
+				netreq->next = NULL;
+			else
+				ups->waiting[*i].last = NULL;
+
+			_fallback_resubmit_netreq(netreq, &now_ms);
+		}
 	}
 }
 
@@ -429,6 +462,11 @@ _getdns_upstream *upstream_iter_next(upstream_iter *i)
 	for ( i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at)
 	    ; i->current && upstream_visited(i, i->current)
 	    ; i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at))
+		DEBUG_STUB("Skipping upstream (name: %s, trans: %s, caps: %x) for caps: %x\n"
+		          , UPSTREAM_GET_NAME(i->current)
+			  , UPSTREAM_GET_TRANSPORT_NAME(i->current)
+			  , (int)i->current->may
+			  , (int)i->cap)
 		; /* pass */
 
 	return i->current;
@@ -979,11 +1017,6 @@ tls_connected(_tls_upstream* upstream, getdns_eventloop *loop)
 	return tls_do_handshake(upstream);
 }
 
-static void _udp_timeout_cb(void *userarg);
-
-static void tls_netreq_timeout_cb(void *arg)
-{ _udp_timeout_cb(arg); }
-
 static int
 _tls_submit(_getdns_upstream *self_up,
     getdns_network_req *netreq, uint64_t *now_ms)
@@ -1011,7 +1044,7 @@ _tls_submit(_getdns_upstream *self_up,
 	    GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
 	    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
 	     getdns_eventloop_event_init(
-	    &netreq->event, netreq, NULL, NULL, tls_netreq_timeout_cb)))
+	    &netreq->event, netreq, NULL, NULL, netreq_timeout_cb)))
 		return STUB_FATAL_ERROR;
 
 	/* Then register the netreq */
@@ -1042,10 +1075,8 @@ static void _doh_cleanup(_getdns_upstream *self_up)
 	struct mem_funcs  *mfs;
 
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self_up);
-
-	if ((mfs = priv_getdns_context_mf(_up_context(self_up)))) {
+	if ((mfs = priv_getdns_context_mf(_up_context(self_up))))
 		GETDNS_FREE(*mfs, self_up);
-	}
 }
 
 static const struct sockaddr *
@@ -1107,8 +1138,10 @@ static void _address_cleanup(_getdns_upstream *self_up)
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self_up);
 
 	if ((mfs = priv_getdns_context_mf(_up_context(self_up)))) {
-		/* TODO: complete address destruction */
-
+		/* TODO: complete address destruction
+		 * like deregister transport upstreams
+		 * for processing waiting queues
+		 */
 		GETDNS_FREE(*mfs, self_up);
 	}
 }
@@ -1225,6 +1258,25 @@ _address_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
 		return (struct sockaddr *)&self->addr;
 	}
 	return NULL;
+}
+
+static void
+_address_start(_getdns_upstream *self, uint64_t *now_ms)
+{
+	_getdns_upstream *start, *child;
+
+	if (!self)
+		return;
+
+	DEBUG_STUB("Start upstream %p for %s with transport %s\n",
+	    (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self));
+
+	start = child = self->children;
+	while (child) {
+		child->vmt->start(child, now_ms);
+		if ((child = child->next) == start)
+			break;
+	}
 }
 
 static getdns_return_t
@@ -1363,32 +1415,46 @@ static void _named_address_answer_cb(
 		 if (rr->rr_i.nxt - rr->rr_i.rr_type != (int)(10 + addrlen))
 			 continue;
 		(void) inet_ntop(af, rr->rr_i.rr_type + 10, a_buf, sizeof(a_buf));
-		fprintf(stderr, "Address lookup (for DoH): %s\n", a_buf);
 
 		/* TODO: Replace this with pass in native address data */
 		if (self->super.vmt == &_doh_uri_vmt) {
 			struct addrinfo   hints;
 			struct addrinfo  *ai = NULL;
 
+			DEBUG_STUB("Address lookup (for DoH): %s\n", a_buf);
+
 			(void) memset(&hints, 0, sizeof(struct addrinfo));
 			hints.ai_family    = AF_UNSPEC;      /* IPv4 or IPv6 */
 			hints.ai_flags     = AI_NUMERICHOST; /* No reverse lookups */
 
-			if (!getaddrinfo(a_buf, "443", &hints, &ai) &&
-			    !_getdns_append_doh_upstream(
-					&self->super, ai, a_buf, &new_upstream) &&
-			    self->port != 443)
-				new_upstream->vmt->set_port(new_upstream, self->port);
+			if (getaddrinfo(a_buf, "443", &hints, &ai))
+				; /* TODO: log getaddrinfo error */
+			else if (_getdns_append_doh_upstream(
+			    &self->super, ai, a_buf, &new_upstream))
+				; /* TODO: do something with append doh_upstream error? */
+			else {
+				uint64_t now_ms = 0;
 
+				if (self->port != 443)
+					new_upstream->vmt->set_port(new_upstream, self->port);
+
+				new_upstream->vmt->start(new_upstream, &now_ms);
+			}
 			if (ai) freeaddrinfo(ai);
 
 		} else if (!_getdns_append_upstream(
 		    &self->super, a_buf, &new_upstream)) {
+			uint64_t now_ms = 0;
+
+			DEBUG_STUB("Address lookup (for named upstream): %s\n", a_buf);
+
 			if (self->port != 53)
 				new_upstream->vmt->set_port(new_upstream, self->port);
 			if (self->tls_port != 853)
 				new_upstream->vmt->set_tls_port(
 				    new_upstream, self->tls_port);
+
+			new_upstream->vmt->start(new_upstream, &now_ms);
 		}
 	}
 	_getdns_context_cancel_request((*netreq)->owner);
@@ -1486,7 +1552,7 @@ static int _named_submit(
 		    GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
 		    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
 		     getdns_eventloop_event_init(
-		    &netreq->event, netreq, NULL, NULL, tls_netreq_timeout_cb)))
+		    &netreq->event, netreq, NULL, NULL, netreq_timeout_cb)))
 			return STUB_FATAL_ERROR;
 
 		return put_netreq_on_waiting_queue(netreq);
@@ -1502,35 +1568,29 @@ static void _named_revoke(
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
 
 	revoke_netreq(netreq);
+
+	/* No registration except for the waiting queues in upstreams
+	 * which are already handled by revoke_netreq
+	 */
 }
 
 static void _named_erred(_getdns_upstream *self_up)
 {
 	/* _named_upstream *self = as_named_up(self_up); */
 	(void)(self_up);
+
+	/* Erred is irrelevant, since this upstreams deregisters itself after 
+	 * scheduling lookups for the name by setting it's capabilities to 0.
+	 */
 }
 
 void
 _named_cleanup(_getdns_upstream *self)
 {
 	struct mem_funcs *mfs;
-	_getdns_upstream *start, *current;
 
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self);
-
-	/* Just call cleanup on one layer in the hierarchy.
-	 * Individual upstreams are responsible for cleaning up their
-	 * children themselfs.
-	 */
-	if (!(start = current = self->children))
-		; /* pass */
-	else do {
-		_getdns_upstream *next = current->next;
-		UPSTREAM_CLEANUP(current);
-		current = next;
-	} while (current && current != start);
-
-	self->children = NULL;
+	upstream_cleanup_children(self);
 	if ((mfs = priv_getdns_context_mf(_up_context(self)))) {
 		/* TODO: complete destruction
 		 * Cancel running address lookups etc.
@@ -1794,23 +1854,6 @@ _udp_erred(_getdns_upstream *self_up)
 }
 
 static void
-_udp_timeout_cb(void *userarg)
-{
-	getdns_network_req *netreq = (getdns_network_req *)userarg;
-
-	assert(netreq);
-	if (!netreq->gup.current)
-		_udp_revoke(NULL, netreq);
-	else {
-		UPSTREAM_REVOKE(netreq->gup.current, netreq);
-		UPSTREAM_ERRED(netreq->gup.current);
-	}
-	_getdns_netreq_change_state(netreq, NET_REQ_TIMED_OUT);
-	netreq->debug_end_time = _getdns_get_time_as_uintt64();
-	_getdns_check_dns_req_complete(netreq->owner);
-}
-
-static void
 _udp_read_cb(void *userarg)
 {
 	getdns_network_req *netreq = (getdns_network_req *)userarg;
@@ -1933,7 +1976,7 @@ _udp_write(_stateless_upstream *self, getdns_network_req *netreq, uint64_t *now_
 	GETDNS_SCHEDULE_EVENT(dnsreq->loop, netreq->fd,
 	    _getdns_ms_until_expiry2(dnsreq->expires, now_ms),
 	    getdns_eventloop_event_init(&netreq->event, netreq,
-	    _udp_read_cb, NULL, _udp_timeout_cb));
+	    _udp_read_cb, NULL, netreq_timeout_cb));
 
 	return GETDNS_RETURN_GOOD;
 }
@@ -1953,25 +1996,30 @@ _udp_write_cb(void *userarg)
 	}
 }
 
-int
+static void _udp_start(_getdns_upstream *self_up, uint64_t *now_ms);
+static int
 _udp_submit(_getdns_upstream *self_up,
     getdns_network_req *netreq, uint64_t *now_ms)
 {
-	_stateless_upstream   *self = as_udp_up(self_up);
+	_stateless_upstream *self = as_udp_up(self_up);
 	socklen_t              addrlen;
-	const struct sockaddr *addr = UPSTREAM_GET_ADDR(self_up, &addrlen);
+	const struct sockaddr *addr;
 
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
-	           (void*)netreq, netreq->request_type);
+	           (void*)netreq, (netreq ? netreq->request_type : -1));
 
 	if (!self)
 		return STUB_TRY_NEXT_UPSTREAM;
 
+	if (!netreq) {
+		_udp_start(self_up, now_ms);
+		return GETDNS_RETURN_GOOD;
+	}
 	if (  self->to_retry <= 0 &&
 	    ++self->to_retry <= 0)
 		return STUB_TRY_NEXT_UPSTREAM;
 
-	if (!addr)
+	if (!(addr = UPSTREAM_GET_ADDR(&self->super, &addrlen)))
 		return GETDNS_RETURN_GENERIC_ERROR;
 
 	netreq->fd = socket(addr->sa_family, SOCK_DGRAM, IPPROTO_UDP);
@@ -1984,11 +2032,76 @@ _udp_submit(_getdns_upstream *self_up,
 	if (netreq->owner->write_udp_immediately)
 		return _udp_write(self, netreq, now_ms);
 
+	/* Clear (timeout) events */
+	if (netreq->event.ev)
+		GETDNS_CLEAR_EVENT(netreq->owner->loop, &netreq->event);
+
 	return GETDNS_SCHEDULE_EVENT(netreq->owner->loop, netreq->fd,
 	    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
 	     getdns_eventloop_event_init(&netreq->event, netreq,
-		     NULL, _udp_write_cb, _udp_timeout_cb));
+		     NULL, _udp_write_cb, netreq_timeout_cb));
 }
+
+static void
+_udp_start(_getdns_upstream *self_up, uint64_t *now_ms)
+{
+	_getdns_upstreams   *ups;
+	const upstream_caps *i;
+	getdns_network_req  *prev_n;
+
+	DEBUG_STUB("%s %-35s\n", STUB_DEBUG_ENTRY, __FUNC__);
+
+	if (!(ups = _up_upstreams(self_up)))
+		return;
+
+	DEBUG_STUB("%s %-35s: UPS: %p\n", STUB_DEBUG_ENTRY, __FUNC__, (void *)ups);
+	/* All transports for this upstream.
+	 * (should be only STATELESS|UNENCRYPTED realisticly, but alas)
+	 */
+	for (i = all_trans_caps; *i; i++) {
+		getdns_network_req *netreq;
+
+		if ((self_up->may & *i) != *i)
+			continue;
+
+		DEBUG_STUB("%s %-35s: suitable cap-transport found: %d\n",
+		     STUB_DEBUG_ENTRY, __FUNC__, *i);
+		prev_n = NULL;
+		netreq = ups->waiting[*i].head;
+		while (netreq) {
+			DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_ENTRY, __FUNC__, (void *)netreq);
+
+			if (!_upstream_cap_complies(netreq->gup.cap, self_up->may)
+			||  _udp_submit(self_up, netreq, now_ms)) {
+				/* Netreq not complient with this upstream or
+				 * failed to submit.  Try next on this queue.
+				 */
+				prev_n = netreq;
+				netreq = netreq->next;
+				continue;
+			}
+			/* Netreq sucessfully submitted!
+			 */
+			netreq->gup.current = self_up;
+			if (!netreq->gup.stop_at)
+				netreq->gup.stop_at = self_up;
+
+			if (ups->waiting[*i].last == netreq)
+				ups->waiting[*i].last = prev_n;
+
+			if (!prev_n) {
+				ups->waiting[*i].head = netreq->next;
+				netreq->next = NULL;
+				netreq = ups->waiting[*i].head;
+			} else {
+				prev_n->next = netreq->next;
+				netreq->next = NULL;
+				netreq = prev_n->next;
+			}
+		}
+	}
+}
+
 
 getdns_return_t
 _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
@@ -2070,12 +2183,16 @@ static const char *_nop_get_name(_getdns_upstream *self)
 static int _nop_submit(
     _getdns_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
 { (void)self; (void)netreq; (void)now_ms
-; fprintf(stderr, "Submit netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self))
+; DEBUG_STUB("Submit netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self))
 ; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+static void _nop_start(_getdns_upstream *self, uint64_t *now_ms)
+{ (void)self; (void)now_ms
+; DEBUG_STUB("Start upstream %p for %s with transport %s\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
+
 static void _nop_revoke(_getdns_upstream *self, getdns_network_req *netreq)
-{ (void)self; (void)netreq; ; fprintf(stderr, "Revoke netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self)); }
+{ (void)self; (void)netreq; ; DEBUG_STUB("Revoke netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self)); }
 static void _nop_erred(_getdns_upstream *self)
-{ (void)self; fprintf(stderr, "Upstream %p for %s with transport %s erred\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
+{ (void)self; DEBUG_STUB("Upstream %p for %s with transport %s erred\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
 
 static void _set_parent_port(_getdns_upstream *self, uint32_t port)
 {
@@ -2118,6 +2235,7 @@ static _getdns_upstream_vmt _base_vmt = {
 	_nop_get_transport_name,
 
 	_nop_submit,
+	_nop_start,
 	_nop_revoke,
 	_nop_erred,
 };
@@ -2131,6 +2249,7 @@ static _getdns_upstream_vmt   _address_vmt = {
 	_nop_get_transport_name,
 
 	_nop_submit,
+	_address_start,
 	_nop_revoke,
 	_nop_erred,
 };
@@ -2144,6 +2263,7 @@ static _getdns_upstream_vmt   _named_vmt = {
 	_nop_get_transport_name,
 
 	_named_submit,
+	_nop_start,
 	_named_revoke,
 	_named_erred,
 };
@@ -2157,6 +2277,7 @@ static _getdns_upstream_vmt   _doh_uri_vmt = {
 	_doh_get_transport_name,
 
 	_named_submit,
+	_nop_start,
 	_named_revoke,
 	_named_erred,
 };
@@ -2170,6 +2291,7 @@ static _getdns_upstream_vmt       _udp_vmt = {
 	_udp_get_transport_name,
 
 	_udp_submit,
+	_udp_start,
 	_udp_revoke,
 	_udp_erred,
 };
@@ -2183,6 +2305,7 @@ static _getdns_upstream_vmt       _tcp_vmt = {
 	_tcp_get_transport_name,
 
 	_nop_submit,
+	_nop_start,
 	_stateful_revoke,
 	_nop_erred,
 };
@@ -2196,6 +2319,7 @@ static _getdns_upstream_vmt       _tls_vmt = {
 	_tls_get_transport_name,
 
 	_tls_submit,
+	_nop_start,
 	_stateful_revoke,
 	_nop_erred,
 };
@@ -2209,6 +2333,7 @@ static _getdns_upstream_vmt       _doh_vmt = {
 	_doh_get_transport_name,
 
 	_tls_submit,
+	_nop_start,
 	_stateful_revoke,
 	_nop_erred,
 };
