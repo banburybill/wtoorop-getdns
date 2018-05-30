@@ -48,7 +48,6 @@ typedef uint16_t upstream_caps;
 #define CAP_AUTHENTICATED     0x0010 /* Not initialized with CAP_MIGHT */
 #define CAP_MIGHT             0xFFE0
 #define CAP_RESOLVED          0x0020 /* Upstream has IP address */
-#define CAP_CONNECTED         0x0040 /* Upstream is connected */
 
 #define CAP_OOOR              0x0080
 #define CAP_QNAME_MIN         0x0100
@@ -88,14 +87,23 @@ static inline int _upstream_cap_complies(upstream_caps req, upstream_caps cap)
 
 
 #define UPSTREAM_CLEANUP(UP)            ((UP)->vmt->cleanup((UP)))
-#define UPSTREAM_AS_DICT(UP, DICT_R)    ((UP)->vmt->as_dict((UP), (DICT_R)))
+#define UPSTREAM_AS_DICT(UP, DICT_R)    ((UP)->vmt->as_dict((UP),(DICT_R)))
 #define UPSTREAM_GET_NAME(UP)           ((UP)->vmt->get_name((UP)))
-#define UPSTREAM_GET_ADDR(UP, LEN_R)    ((UP)->vmt->get_addr((UP), (LEN_R)))
+#define UPSTREAM_GET_ADDR(UP, LEN_R)    ((UP)->vmt->get_addr((UP),(LEN_R)))
 #define UPSTREAM_GET_TRANSPORT_NAME(UP) ((UP)->vmt->get_transport_name((UP)))
 
-#define UPSTREAM_SUBMIT(UP, NETREQ, MS) ((UP)->vmt->submit((UP), (NETREQ), (MS)))
-#define UPSTREAM_REVOKE(UP, NETREQ)     ((UP)->vmt->revoke((UP), (NETREQ)))
+#define UPSTREAM_SUBMIT(UP, NETREQ, MS) ((UP)->vmt->submit((UP),(NETREQ),(MS)))
+#define UPSTREAM_SEND(UP, NETREQ, MS)   ((UP)->vmt->send((UP),(NETREQ),(MS)))
+#define UPSTREAM_START(UP, MS)          ((UP)->vmt->start((UP),(MS)))
+#define UPSTREAM_RUN(UP, MS)            ((UP)->vmt->run((UP),(MS)))
+#define UPSTREAM_REVOKE(UP, NETREQ)     ((UP)->vmt->revoke((UP),(NETREQ)))
 #define UPSTREAM_ERRED(UP)              ((UP)->vmt->erred((UP)))
+
+#define UPSTREAM_EQUIP(UP, AF, IP, NEW_UP) \
+    ((UP)->vmt->equip((UP),(AF),(IP),(NEW_UP)))
+#define UPSTREAM_SETUP_TLS_CTX(UP)      ((UP)->vmt->setup_tls_ctx((UP)))
+
+
 
 typedef struct _getdns_upstream _getdns_upstream;
 typedef const struct _getdns_upstream_vmt {
@@ -130,20 +138,42 @@ typedef const struct _getdns_upstream_vmt {
 	 *   - GETDNS_RETURN_IO_ERROR: or any other error.  This will cause 
 	 *                             erred() to be called for this upstream,
 	 *                             which does the failure management, such
-	 *                             as backing off this upstream when needed.
+	 *                             as backing off this upstream if needed.
+	 *
+	 * When upstreams need initialisation (for example connecting
+	 * stateful transports), but the request might be handled with this
+	 * upstream.  It is put on a waiting queue.
 	 */
-	int             (*submit)(_getdns_upstream *s, getdns_network_req *netreq, uint64_t *now_ms);
+	int (*submit)(_getdns_upstream *s,
+	    getdns_network_req *netreq, uint64_t *now_ms);
+
+	/* send() is like submit but assumes that the upstream is connected
+	 * send() will handle waiting queues (and will not put netreqs on them)
+	 * send() will not be called directly by _getdns_submit_stub_request().
+	 *        but only via submit() and or start() and run()
+	 *
+	 * For stateless upstreams send() should be equivalent to submit().
+	 */
+	int (*send)(_getdns_upstream *s,
+	    getdns_network_req *netreq, uint64_t *now_ms);
 
 	/* start() is called after a upstream is constructed and positioned in
 	 * the "upstreams" data-structure.  start() is for example run with
 	 * address upstreams that were constructed and inserted in the data-
 	 * structure as a result of address lookups (with named upstreams).
 	 *
-	 * When start is called, the upstream could take a peek at the waiting
-	 * queue for the transports it is serving, to see whether there are
-	 * network requests it could start processing.
+	 * When start is called for an upstream that needs initialisation,
+	 * such as connecting stateful transport, that initialisation is
+	 * initiated.
+	 *
+	 * For stateless upstreams start() should be equivalent to run().
 	 */
-	void            (*start)(_getdns_upstream *s, uint64_t *now_ms);
+	int (*start)(_getdns_upstream *s, uint64_t *now_ms);
+
+	/* run() will take netreqs from the (for the upstream's transport)
+	 * waiting queue, and feed them to send().
+	 */
+	int (*run)(_getdns_upstream *s, uint64_t *now_ms);
 
 	/* revoke() deregisters the netreq with the upstream.
 	 * This may involve:
@@ -152,14 +182,23 @@ typedef const struct _getdns_upstream_vmt {
 	 *   - Closing sockets and freeing other resources.
 	 *   - Clearing or rescheduling I/O events.
 	 */
-	void            (*revoke)(_getdns_upstream *s, getdns_network_req *netreq);
+	void (*revoke)(_getdns_upstream *s, getdns_network_req *netreq);
 
 	/* erred() is called when the upstream failed (for a request).
 	 * The number of failures are tracked, and the upstream is registered
 	 * to be backed off if needed.  A backed off upstream will result in
 	 * STUB_TRY_NEXT_UPSTREAM returned from submit().
 	 */
-	void            (*erred)(_getdns_upstream *s);
+	void (*erred)(_getdns_upstream *s);
+
+
+	/* Methods for descendant classes:
+	 */
+	/* For named_upstream and the descendant doh_uri_upstream */
+	getdns_return_t (*equip)(_getdns_upstream *self,
+	    int af, const uint8_t *addr, _getdns_upstream **new_upstream);
+	/* For tls_upstream and the descendant doh_upstream */
+	SSL_CTX *(*setup_tls_ctx)(_getdns_upstream *self);
 } _getdns_upstream_vmt;
 
 
@@ -171,7 +210,11 @@ struct _getdns_upstream {
         _getdns_upstream     *next;
 	_getdns_upstream_vmt *vmt;
 	upstream_caps         may;
-	upstream_caps         can;
+
+	/* This upstream is running and will process requests from
+	 * the waiting queues for its transport capabilities.
+	 */
+	unsigned int          processing : 1;
 };
 
 _getdns_upstream *_getdns_next_upstream(_getdns_upstream *current,
@@ -250,11 +293,6 @@ static inline int upstream_visited(upstream_iter *i, _getdns_upstream *u)
 { size_t bit; if (!i || !i->skip_sz || !u)  return 0
 ; bit = (size_t)(bitmix64_hash((uint64_t)u) & (i->skip_sz - 1))
 ; return i->skip_bits[bit >> 3] & (1 << (bit & 7)); }
-
-void upstream_set_visited(
-    struct mem_funcs *mfs, upstream_iter *i, _getdns_upstream *u);
-
-
 
 typedef enum getdns_tsig_algo_ {
         GETDNS_NO_TSIG_     = 0, /* Do not use tsig */

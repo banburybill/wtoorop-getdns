@@ -1734,6 +1734,10 @@ main(int argc, char **argv)
 {
 	getdns_return_t r;
 
+#if !defined(GETDNS_ON_WINDOWS) && defined(SIGPIPE) && defined(SIG_IGN)
+	(void)signal(SIGPIPE, SIG_IGN);
+#endif
+
 	name = the_root;
 	if ((r = getdns_context_create(&context, 1))) {
 		fprintf(stderr, "Create context failed: %d\n", (int)r);

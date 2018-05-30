@@ -224,6 +224,7 @@ typedef struct getdns_network_req
 	/* For stub resolving */
 	// GUPs {
 	upstream_iter           gup;
+	uint32_t                stream_id; /* For DoH */
 	// } GUPS
 	struct getdns_upstream *first_upstream;
 	struct getdns_upstream *upstream;

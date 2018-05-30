@@ -42,6 +42,7 @@
 #include <iphlpapi.h>
 typedef unsigned short in_port_t;
 #endif
+#include <netinet/tcp.h>
 
 
 #define STUB_TCP_RETRY           -6 /* Event has been rescheduled.
@@ -63,6 +64,22 @@ typedef unsigned short in_port_t;
 				     */
 
 #define TIMEOUT_TLS 2500
+
+#define UP_LOG(UP, LEVEL, FMT, ...) \
+    _getdns_context_log( _up_context((UP)), GETDNS_LOG_STUB, (LEVEL) \
+                       , "%s (%s) - " FMT "\n" \
+		       , UPSTREAM_GET_NAME((UP)) \
+		       , UPSTREAM_GET_TRANSPORT_NAME((UP)) \
+		       , __VA_ARGS__ )
+
+#define UP_EMERG(UP, ...) UP_LOG((UP), GETDNS_LOG_EMERG, __VA_ARGS__)
+#define UP_ALERT(UP, ...) UP_LOG((UP), GETDNS_LOG_ALERT, __VA_ARGS__)
+#define UP_CRIT(UP, ...) UP_LOG((UP), GETDNS_LOG_CRIT, __VA_ARGS__)
+#define UP_ERR(UP, ...) UP_LOG((UP), GETDNS_LOG_ERR, __VA_ARGS__)
+#define UP_WARN(UP, ...) UP_LOG((UP), GETDNS_LOG_WARNING, __VA_ARGS__)
+#define UP_NOTICE(UP, ...) UP_LOG((UP), GETDNS_LOG_NOTICE, __VA_ARGS__)
+#define UP_INFO(UP, ...) UP_LOG((UP), GETDNS_LOG_INFO, __VA_ARGS__)
+#define UP_DEBUG(UP, ...) UP_LOG((UP), GETDNS_LOG_DEBUG, __VA_ARGS__)
 
 static const upstream_caps all_trans_caps[] = {
 	(CAP_STATELESS | CAP_UNENCRYPTED),
@@ -90,21 +107,24 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms);
 
 static void _fallback_resubmit_netreq(getdns_network_req *netreq, uint64_t *now_ms)
 {
+	int r;
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
 	           (void*)netreq, netreq->request_type);
 
-	if (_getdns_submit_stub_request(netreq, now_ms) == GETDNS_RETURN_GOOD)
-		return; /* netreq still in flight */
-
-	/* TODO: Setting debug_end_time and calling 
-	 * _getdns_check_dns_req_complete(netreq->owner)
-	 * can be done from _getdns_netreq_change_state really.
-	 * When state is changed to something finite.
-	 */
-	assert(!netreq->event.ev);
-	_getdns_netreq_change_state(netreq, NET_REQ_ERRORED);
-	netreq->debug_end_time = _getdns_get_time_as_uintt64();
-	_getdns_check_dns_req_complete(netreq->owner);
+	r = _getdns_submit_stub_request(netreq, now_ms);
+	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d submit returned: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
+		   (void*)netreq, netreq->request_type, r);
+	if (r) {
+		/* TODO: Setting debug_end_time and calling 
+		 * _getdns_check_dns_req_complete(netreq->owner)
+		 * can be done from _getdns_netreq_change_state really.
+		 * When state is changed to something finite.
+		 */
+		assert(!netreq->event.ev);
+		_getdns_netreq_change_state(netreq, NET_REQ_ERRORED);
+		netreq->debug_end_time = _getdns_get_time_as_uintt64();
+		_getdns_check_dns_req_complete(netreq->owner);
+	}
 }
 
 static void upstream_cleanup_children(_getdns_upstream *self)
@@ -130,7 +150,7 @@ static void upstream_cleanup_children(_getdns_upstream *self)
 
 /* Virtual Method Tables (initialized at end of file) */
 
-static _getdns_upstream_vmt      _base_vmt;
+static _getdns_upstream_vmt _upstreams_vmt;
 static _getdns_upstream_vmt   _address_vmt;
 static _getdns_upstream_vmt     _named_vmt;
 static _getdns_upstream_vmt   _doh_uri_vmt;
@@ -138,6 +158,135 @@ static _getdns_upstream_vmt       _udp_vmt;
 static _getdns_upstream_vmt       _tcp_vmt;
 static _getdns_upstream_vmt       _tls_vmt;
 static _getdns_upstream_vmt       _doh_vmt;
+
+/* Functions for upstream_iter
+ *****************************************************************************/
+static void
+upstream_set_visited(
+    struct mem_funcs *mfs, upstream_iter *i, _getdns_upstream *u)
+{
+	size_t bit; 
+
+	if (i->skip_sz == 0) {
+		const size_t default_skip_sz = 1024;
+
+		if (!(i->skip_bits = GETDNS_XMALLOC(
+		    *mfs, uint8_t, default_skip_sz / 8)))
+			return;
+		(void) memset(i->skip_bits, 0, default_skip_sz / 8);
+		i->skip_sz = default_skip_sz;
+	}
+	bit = (size_t)(bitmix64_hash((uint64_t)u) & (i->skip_sz - 1));
+	i->skip_bits[bit >> 3] |= (1 << (bit & 7));
+}
+
+static void
+upstream_unset_visited(upstream_iter *i, _getdns_upstream *u)
+{
+	size_t bit;
+
+	if (!i->skip_sz)
+		return;
+
+	bit = (size_t)(bitmix64_hash((uint64_t)u) & (i->skip_sz - 1));
+	i->skip_bits[bit >> 3] &= (0xFF ^ (1 << (bit & 7)));
+}
+
+
+_getdns_upstream *upstream_iter_init(upstream_iter *iter,
+    _getdns_upstreams *upstreams, upstream_caps cap)
+{
+	if (!iter) return NULL;
+	iter->cap = cap;
+	iter->stop_at = NULL;
+	if (!(iter->current = upstreams->current[cap & CAP_TRANS])) {
+		_getdns_upstream *current = upstreams->super.children;
+
+		if (!current
+		|| (!_upstream_cap_complies((cap & CAP_TRANS), current->may)
+		   && !(current = _getdns_next_upstream(
+				   current, (cap & CAP_TRANS), NULL))))
+			return NULL;
+		iter->current = upstreams->current[cap & CAP_TRANS] = current;
+	}
+	if (upstreams->context->round_robin_upstreams)
+		upstreams->current[cap & CAP_TRANS]  =
+		    _getdns_next_upstream(upstreams->current[cap & CAP_TRANS],
+				    (cap & CAP_TRANS), NULL);
+
+	if (_upstream_cap_complies(cap, iter->current->may))
+		return (iter->stop_at = iter->current);
+
+	return (iter->stop_at = iter->current =
+	    _getdns_next_upstream(iter->current, cap, NULL));
+}
+
+_getdns_upstream *upstream_iter_next(upstream_iter *i)
+{
+	if (!i)
+		return NULL;
+
+	for ( i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at)
+	    ; i->current && upstream_visited(i, i->current)
+	    ; i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at))
+		DEBUG_STUB("Skipping upstream (name: %s, trans: %s, caps: %x) for caps: %x\n"
+		          , UPSTREAM_GET_NAME(i->current)
+			  , UPSTREAM_GET_TRANSPORT_NAME(i->current)
+			  , (int)i->current->may
+			  , (int)i->cap)
+		; /* pass */
+
+	return i->current;
+}
+
+/* netreq_next_upstream on first use returns the first upstream to use
+ * on successive calls the next upstream to try is returned, untill
+ * everything has been tried, then NULL is returned.
+ */
+static _getdns_upstream *netreq_next_upstream(getdns_network_req *netreq)
+{
+	_getdns_upstream *up;
+
+	if (!netreq)
+		return NULL;
+
+	if (netreq->gup.current) {
+		if ((up = upstream_iter_next(&netreq->gup)))
+			return up;
+
+		/* Try next transport */
+		netreq->transport_current += 1;
+	}
+	while (netreq->transport_current < netreq->transport_count) {
+		upstream_caps cap;
+
+		switch (netreq->transports[netreq->transport_current]) {
+		case GETDNS_TRANSPORT_UDP: cap = CAP_STATELESS | CAP_UNENCRYPTED;
+		                           break;
+		case GETDNS_TRANSPORT_TCP: cap = CAP_STATEFUL | CAP_UNENCRYPTED;
+		                           break;
+		case GETDNS_TRANSPORT_TLS: cap = CAP_STATEFUL | CAP_ENCRYPTED;
+		                           if (netreq->tls_auth_min ==
+		                               GETDNS_AUTHENTICATION_REQUIRED)
+		                           	cap |= CAP_AUTHENTICATED;
+		                           break;
+		default                  : cap = 0;
+		                           break;
+		}
+		if (netreq->owner->want_cap_resolved)
+			cap |= CAP_RESOLVED;
+
+		if ((up = upstream_iter_init(
+		    &netreq->gup, &netreq->owner->context->gups, cap)))
+			return up;
+
+		/* Try next transport */
+		netreq->transport_current += 1;
+	}
+	return NULL;
+}
+
+
 
 /* Functions for _getdns_upstreams 
  *****************************************************************************/
@@ -149,12 +298,12 @@ _getdns_upstreams_init(_getdns_upstreams *upstreams, getdns_context *context)
 	(void) memset(upstreams, 0, sizeof(_getdns_upstreams));
 	upstreams->context = context;
 	upstreams->super.next = &upstreams->super;
-	upstreams->super.vmt  = &_base_vmt;
+	upstreams->super.vmt  = &_upstreams_vmt;
 }
 
 static inline _getdns_upstreams *_up_upstreams(_getdns_upstream *up)
 { if (!up) return NULL; while (up->parent) up = up->parent
-; return up->vmt == &_base_vmt ? (_getdns_upstreams *)up : NULL; }
+; return up->vmt == &_upstreams_vmt ? (_getdns_upstreams *)up : NULL; }
 
 void
 _getdns_context_set_upstreams(getdns_context *context, _getdns_upstreams *upstreams)
@@ -181,7 +330,7 @@ _getdns_context_set_upstreams(getdns_context *context, _getdns_upstreams *upstre
 void
 _getdns_upstreams_cleanup(_getdns_upstreams *upstreams)
 {
-	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)upstreams);
+	DEBUG_STUB("%s %-35s: UPSTREAMS: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)upstreams);
 	upstream_cleanup_children(&upstreams->super);
 }
 
@@ -221,16 +370,22 @@ _getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
 }
 
 static void
-increment_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
+register_processing(_getdns_upstream *up)
 {
+	_getdns_upstreams *ups = _up_upstreams(up);
 	const upstream_caps *i;
 
 	if (!ups)
 		return;
 
+	if (up->processing)
+		return;
+
 	for (i = all_trans_caps; *i; i++)
-		if ((cap & *i) == *i)
+		if ((up->may & *i) == *i)
 			ups->processing[*i] += 1;
+
+	up->processing = 1;
 }
 
 static int
@@ -316,14 +471,23 @@ netreq_timeout_cb(void *userarg)
 }
 
 static void
-decrement_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
+deregister_processing(_getdns_upstream *up, upstream_caps cap)
 {
+	_getdns_upstreams *ups = _up_upstreams(up);
 	const upstream_caps *i;
 	uint64_t now_ms;
 
 	if (!ups)
 		return;
 
+	DEBUG_STUB("Deregister upstream (name: %s, trans: %s, caps: %x,for processing: %d)\n"
+	          , UPSTREAM_GET_NAME(up), UPSTREAM_GET_TRANSPORT_NAME(up)
+                  , cap, up->processing);
+
+	if (!up->processing)
+		return;
+
+	up->processing = 0;
 	now_ms = 0;
 	for (i = all_trans_caps; *i; i++) {
 
@@ -362,6 +526,108 @@ decrement_transport_processing(_getdns_upstreams *ups, upstream_caps cap)
 		}
 	}
 }
+
+static void _upstream_erred(_getdns_upstream *self)
+{
+	DEBUG_STUB("%s %-35s: UPSTREAM: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self);
+
+	if (!self)
+		return;
+
+	deregister_processing(self, self->may);
+}
+
+static int 
+send_from_waiting_queue(_getdns_upstream *self, uint64_t *now_ms)
+{
+	_getdns_upstreams   *ups;
+	const upstream_caps *i;
+	getdns_network_req  *prev_n;
+	int r;
+
+	DEBUG_STUB("%s %-35s\n", STUB_DEBUG_ENTRY, __FUNC__);
+
+	if (!(ups = _up_upstreams(self)))
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	DEBUG_STUB("%s %-35s: UPS: %p\n", STUB_DEBUG_ENTRY, __FUNC__, (void *)ups);
+	/* All transports for this upstream. */
+
+	for (i = all_trans_caps; *i; i++) {
+		getdns_network_req *netreq;
+
+		if ((self->may & *i) != *i)
+			continue;
+
+		DEBUG_STUB("%s %-35s: suitable cap-transport found: %d\n",
+		     STUB_DEBUG_ENTRY, __FUNC__, *i);
+		prev_n = NULL;
+		netreq = ups->waiting[*i].head;
+		while (netreq) {
+			DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_ENTRY, __FUNC__, (void *)netreq);
+
+			if (!_upstream_cap_complies(netreq->gup.cap, self->may)
+			||  (  netreq->gup.current != self
+			    && upstream_visited(&netreq->gup, self))
+			||  (  r = UPSTREAM_SEND(self, netreq, now_ms))
+			    == STUB_TRY_NEXT_UPSTREAM) {
+				/* Netreq not complient with this upstream. */
+				DEBUG_STUB("Skipping upstream (name: %s, trans: %s, caps: %x) for caps: %x\n"
+					  , UPSTREAM_GET_NAME(netreq->gup.current)
+					  , UPSTREAM_GET_TRANSPORT_NAME(netreq->gup.current)
+					  , (int)netreq->gup.current->may
+				  , (int)netreq->gup.cap);
+
+				prev_n = netreq;
+				netreq = netreq->next;
+				continue;
+			}
+			DEBUG_STUB( "%s %-35s: MSG: %p, send returned: %d\n"
+			          , STUB_DEBUG_ENTRY, __FUNC__, (void *)netreq, r);
+			upstream_set_visited(
+			    &netreq->owner->my_mf, &netreq->gup, self);
+			if (r)
+				return r;
+
+			/* Netreq sucessfully submitted! */
+			/* Set upstream iterator of this netreq to self */
+			if (netreq->gup.current != self) {
+				if (netreq->gup.current) {
+					/* This upstream might be retried
+					 * later.
+					 */
+					upstream_unset_visited(
+					    &netreq->gup,
+					     netreq->gup.current);
+					/* We cannot revoke, because that
+					 * might deregister things which
+					 * have been registered by the
+					 * earlier call to send.
+					 */
+				}
+				netreq->gup.current = self;
+				if (!netreq->gup.stop_at)
+					netreq->gup.stop_at = self;
+			}
+			/* Remove netreq from waiting queue */
+			if (ups->waiting[*i].last == netreq)
+				ups->waiting[*i].last = prev_n;
+
+			if (!prev_n && ups->waiting[*i].head == netreq) {
+				ups->waiting[*i].head = netreq->next;
+				netreq->next = NULL;
+				netreq = ups->waiting[*i].head;
+
+			} else if (prev_n && prev_n->next == netreq) {
+				prev_n->next = netreq->next;
+				netreq->next = NULL;
+				netreq = prev_n->next;
+			}
+		}
+	}
+	return GETDNS_RETURN_GOOD;
+}
+
 
 /* functions for _getdns_upstream data-structure traversal & maintenance 
  *****************************************************************************/
@@ -423,122 +689,6 @@ _upstream_append(_getdns_upstream *parent, _getdns_upstream *child)
 	child->next = parent->children;
 }
 
-/* Functions for upstream_iter
- *****************************************************************************/
-
-_getdns_upstream *upstream_iter_init(upstream_iter *iter,
-    _getdns_upstreams *upstreams, upstream_caps cap)
-{
-	if (!iter) return NULL;
-	iter->cap = cap;
-	iter->stop_at = NULL;
-	if (!(iter->current = upstreams->current[cap & CAP_TRANS])) {
-		_getdns_upstream *current = upstreams->super.children;
-
-		if (!current
-		|| (!_upstream_cap_complies((cap & CAP_TRANS), current->may)
-		   && !(current = _getdns_next_upstream(
-				   current, (cap & CAP_TRANS), NULL))))
-			return NULL;
-		iter->current = upstreams->current[cap & CAP_TRANS] = current;
-	}
-	if (upstreams->context->round_robin_upstreams)
-		upstreams->current[cap & CAP_TRANS]  =
-		    _getdns_next_upstream(upstreams->current[cap & CAP_TRANS],
-				    (cap & CAP_TRANS), NULL);
-
-	if (_upstream_cap_complies(cap, iter->current->may))
-		return (iter->stop_at = iter->current);
-
-	return (iter->stop_at = iter->current =
-	    _getdns_next_upstream(iter->current, cap, NULL));
-}
-
-_getdns_upstream *upstream_iter_next(upstream_iter *i)
-{
-	if (!i)
-		return NULL;
-
-	for ( i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at)
-	    ; i->current && upstream_visited(i, i->current)
-	    ; i->current = _getdns_next_upstream(i->current, i->cap, i->stop_at))
-		DEBUG_STUB("Skipping upstream (name: %s, trans: %s, caps: %x) for caps: %x\n"
-		          , UPSTREAM_GET_NAME(i->current)
-			  , UPSTREAM_GET_TRANSPORT_NAME(i->current)
-			  , (int)i->current->may
-			  , (int)i->cap)
-		; /* pass */
-
-	return i->current;
-}
-
-void
-upstream_set_visited(
-    struct mem_funcs *mfs, upstream_iter *i, _getdns_upstream *u)
-{
-	size_t bit;
-
-	if (i->skip_sz == 0) {
-		const size_t default_skip_sz = 1024;
-
-		if (!(i->skip_bits = GETDNS_XMALLOC(
-		    *mfs, uint8_t, default_skip_sz / 8)))
-			return;
-		(void) memset(i->skip_bits, 0, default_skip_sz / 8);
-		i->skip_sz = default_skip_sz;
-	}
-	bit = (size_t)(bitmix64_hash((uint64_t)u) & (i->skip_sz - 1));
-	i->skip_bits[bit >> 3] |= (1 << (bit & 7));
-}
-
-/* netreq_next_upstream on first use returns the first upstream to use
- * on successive calls the next upstream to try is returned, untill
- * everything has been tried, then NULL is returned.
- */
-static _getdns_upstream *netreq_next_upstream(getdns_network_req *netreq)
-{
-	_getdns_upstream *up;
-
-	if (!netreq)
-		return NULL;
-
-	if (netreq->gup.current) {
-		if ((up = upstream_iter_next(&netreq->gup)))
-			return up;
-
-		/* Try next transport */
-		netreq->transport_current += 1;
-	}
-	while (netreq->transport_current < netreq->transport_count) {
-		upstream_caps cap;
-
-		switch (netreq->transports[netreq->transport_current]) {
-		case GETDNS_TRANSPORT_UDP: cap = CAP_STATELESS | CAP_UNENCRYPTED;
-		                           break;
-		case GETDNS_TRANSPORT_TCP: cap = CAP_STATEFUL | CAP_UNENCRYPTED;
-		                           break;
-		case GETDNS_TRANSPORT_TLS: cap = CAP_STATEFUL | CAP_ENCRYPTED;
-		                           if (netreq->tls_auth_min ==
-		                               GETDNS_AUTHENTICATION_REQUIRED)
-		                           	cap |= CAP_AUTHENTICATED;
-		                           break;
-		default                  : cap = 0;
-		                           break;
-		}
-		if (netreq->owner->want_cap_resolved)
-			cap |= CAP_RESOLVED;
-
-		if ((up = upstream_iter_init(
-		    &netreq->gup, &netreq->owner->context->gups, cap)))
-			return up;
-
-		/* Try next transport */
-		netreq->transport_current += 1;
-	}
-	return NULL;
-}
-
-
 /* Address based upstreams
  *****************************************************************************/
 
@@ -556,19 +706,21 @@ typedef struct _edns_cookie_st {
 
 typedef struct _stateless_upstream {
 	_getdns_upstream super;
-	_edns_cookie_st  cookie;
+
 	int              to_retry; /* (initialized to 1) */
 	int              back_off; /* (initialized to 1) */
 	size_t           n_responses;
 	size_t           n_timeouts;
+	_edns_cookie_st  cookie;
 } _stateless_upstream;
 
 static void
 _stateless_upstream_init(_stateless_upstream *up)
 {
 	assert(up);
-	up->super.vmt = &_base_vmt;
+	up->super.vmt = &_upstreams_vmt;
 	up->super.may = CAP_MIGHT | CAP_STATELESS | CAP_UNENCRYPTED;
+	up->super.processing = 0;
 	up->to_retry = 1;
 	up->back_off = 1;
 }
@@ -596,13 +748,14 @@ static inline _stateless_upstream *as_udp_up(_getdns_upstream *up)
 typedef struct _stateful_upstream {
 	_getdns_upstream        super;
 
-	_edns_cookie_st         cookie;
+	unsigned int            connected : 1;
 
 	int                     fd;
 	getdns_eventloop_event  event;
 	getdns_eventloop       *loop;
 	
 	getdns_tcp_state        tcp;
+	_edns_cookie_st         cookie;
 
 	/* These are running totals or historical info */
 	size_t                  conn_completed;
@@ -649,8 +802,10 @@ static void
 _stateful_upstream_init(_stateful_upstream *up)
 {
 	assert(up);
-	up->super.vmt = &_base_vmt;
+	up->super.vmt = &_upstreams_vmt;
 	up->super.may = CAP_MIGHT | CAP_STATEFUL | CAP_UNENCRYPTED;
+	up->super.processing = 0;
+	up->connected = 0;
 	up->fd = -1;
 	up->conn_backoff_interval = 1;
 	(void) getdns_eventloop_event_init(&up->event, up, NULL, NULL, NULL);
@@ -667,7 +822,7 @@ _tcp_upstream_init(_stateful_upstream *up)
 }
 
 static inline _stateful_upstream *as_stateful_up(_getdns_upstream *up)
-{ return up && (  up->vmt == &_tcp_vmt 
+{ return up && (  up->vmt == &_tcp_vmt
                || up->vmt == &_tls_vmt
                || up->vmt == &_doh_vmt ) ? (_stateful_upstream *)up : NULL; }
 
@@ -680,51 +835,6 @@ static void _stateful_revoke(_getdns_upstream *self_up, getdns_network_req *netr
 	revoke_netreq(netreq);
 	/* TODO: Removing the netreq from netreq_by_query_id */
 }
-
-typedef struct _tls_upstream {
-	_stateful_upstream super;
-	
-	/* Settings */
-	uint16_t               tls_port;
-        char                  *tls_cipher_list;
-        char                  *tls_curves_list;
-        char                   tls_auth_name[256];
-        sha256_pin_t          *tls_pubkey_pinset;
-
-	/* State */
-        SSL*                   tls_obj;
-        SSL_SESSION*           tls_session;
-        getdns_tls_hs_state_t  tls_hs_state;
-        getdns_auth_state_t    tls_auth_state;
-        unsigned               tls_fallback_ok : 1;
-	getdns_auth_state_t    best_tls_auth_state;
-	getdns_auth_state_t    last_tls_auth_state;
-} _tls_upstream;
-
-static void
-_tls_upstream_init(_tls_upstream *up)
-{
-	_stateful_upstream_init(&up->super);
-	up->super.super.vmt = &_tls_vmt;
-	up->super.super.may = CAP_MIGHT | CAP_STATEFUL | CAP_ENCRYPTED;
-
-	/* Settings */
-	up->tls_port = 853;
-	up->tls_cipher_list = NULL;
-	up->tls_curves_list = NULL;
-	up->tls_auth_name[0] = '\0';
-	up->tls_pubkey_pinset = NULL;
-
-	/* State */
-	up->tls_hs_state = GETDNS_HS_NONE;
-	up->tls_auth_state = GETDNS_AUTH_NONE;
-	up->last_tls_auth_state = GETDNS_AUTH_NONE;
-	up->best_tls_auth_state = GETDNS_AUTH_NONE;
-}
-
-static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
-{ return up && (  up->vmt == &_tls_vmt
-               || up->vmt == &_doh_vmt ) ? (_tls_upstream *)up : NULL; }
 
 static int
 tcp_connect(_stateful_upstream *self)
@@ -744,7 +854,7 @@ tcp_connect(_stateful_upstream *self)
 	    addr->sa_family == AF_INET6,
 	    fd);
 
-	//_getdns_sock_nonblock(fd);
+	_getdns_sock_nonblock(fd);
 	/* Note that error detection is different with TFO. Since the handshake
 	   doesn't start till the sendto() lack of connection is often delayed until
 	   then or even the subsequent event depending on the error and platform.*/
@@ -786,7 +896,6 @@ tcp_connect(_stateful_upstream *self)
 	return fd;
 }
 
-
 static int
 tcp_connected(_stateful_upstream *upstream) {
 	int error = 0;
@@ -815,73 +924,142 @@ tcp_connected(_stateful_upstream *upstream) {
 	return GETDNS_RETURN_GOOD;
 }
 
-typedef struct _doh_upstream {
-	_tls_upstream super;
-	
-	/* settings */
-	socklen_t                addr_len;
-	struct sockaddr_storage  addr;
-	char                     uri[4096];
 
-	_tsig_st                 tsig;
+typedef struct _tls_upstream {
+	_stateful_upstream super;
 
-	/* state */
-	SSL_CTX                 *tls_ctx;
-} _doh_upstream;
+	socklen_t               addr_len;
+	struct sockaddr_storage addr;
 
-static inline _doh_upstream *as_doh_up(_getdns_upstream *up)
-{ return up && up->vmt == &_doh_vmt ? (_doh_upstream *)up : NULL; }
+	/* Settings */
+        char                   *tls_cipher_list;
+        char                   *tls_curves_list;
+        char                    tls_auth_name[256];
+        sha256_pin_t           *tls_pubkey_pinset;
 
-static int
-select_next_proto_cb(SSL * ssl, unsigned char **out,
-    unsigned char *outlen, const unsigned char *in, unsigned int inlen, void *arg)
-{
-	_stateful_upstream *up = (_stateful_upstream *)arg;
-	(void) ssl;
-
-	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
-	             __FUNC__, up->fd);
-
-	if (nghttp2_select_next_protocol(out, outlen, in, inlen) <= 0)
-		UPSTREAM_ERRED(&up->super);
-		
-	return SSL_TLSEXT_ERR_OK;
-}
+	/* State */
+        SSL*                    tls_obj;
+        SSL_SESSION*            tls_session;
+        getdns_tls_hs_state_t   tls_hs_state;
+        getdns_auth_state_t     tls_auth_state;
+        unsigned                tls_fallback_ok : 1;
+	getdns_auth_state_t     best_tls_auth_state;
+	getdns_auth_state_t     last_tls_auth_state;
+} _tls_upstream;
 
 static void
-tls_read_cb(void *arg)
+_tls_upstream_init(_tls_upstream *up, const struct addrinfo *ai, uint16_t port)
 {
-	_tls_upstream *upstream = (_tls_upstream *)arg;
-	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_READ, 
-	             __FUNC__, upstream->super.fd);
+	_stateful_upstream_init(&up->super);
+	up->super.super.vmt = &_tls_vmt;
+	up->super.super.may = CAP_MIGHT | CAP_STATEFUL | CAP_ENCRYPTED;
+
+	up->addr_len = ai->ai_addrlen;
+	(void) memcpy(&up->addr, ai->ai_addr, ai->ai_addrlen);
+	switch ((up->addr.ss_family = ai->ai_family)) {
+	case AF_INET:
+		((struct sockaddr_in *)(&up->addr))->sin_port = htons(port);
+		break;
+	case AF_INET6:
+		((struct sockaddr_in6 *)(&up->addr))->sin6_port = htons(port);
+	default:
+		break;
+	};
+
+	/* Settings */
+	up->tls_cipher_list = NULL;
+	up->tls_curves_list = NULL;
+	up->tls_auth_name[0] = '\0';
+	up->tls_pubkey_pinset = NULL;
+
+	/* State */
+	up->tls_hs_state = GETDNS_HS_NONE;
+	up->tls_auth_state = GETDNS_AUTH_NONE;
+	up->last_tls_auth_state = GETDNS_AUTH_NONE;
+	up->best_tls_auth_state = GETDNS_AUTH_NONE;
 }
+
+static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
+{ return up && (  up->vmt == &_tls_vmt
+               || up->vmt == &_doh_vmt ) ? (_tls_upstream *)up : NULL; }
+
+static void _tls_cleanup(_getdns_upstream *self_up)
+{
+	_tls_upstream *self = as_tls_up(self_up);
+
+	if (!self)
+		return;
+	if (self->tls_session) {
+		SSL_SESSION_free(self->tls_session);
+		self->tls_session = NULL;
+	}
+	if (self->tls_obj) {
+		SSL_free(self->tls_obj);
+		self->tls_obj = NULL;
+	}
+}
+
+static void _tls_set_port(_getdns_upstream *self_up, uint32_t port)
+{
+	_tls_upstream *self = as_tls_up(self_up);
+
+	if (!self)
+		; /* pass */
+
+	else if (self->addr.ss_family == AF_INET)
+		((struct sockaddr_in *)(&self->addr))->sin_port = htons(port);
+
+	else if (self->addr.ss_family == AF_INET6)
+		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
+}
+
+static const struct sockaddr *
+_tls_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
+{
+	_tls_upstream *self = as_tls_up(self_up);
+
+	if (self) {
+		if (addrlen) *addrlen = self->addr_len;
+		return (struct sockaddr *)&self->addr;
+	}
+	return NULL;
+}
+
+static int tls_do_handshake(_tls_upstream *upstream, uint64_t *now_ms);
 
 static void
-tls_write_cb(void *arg)
+tls_hs_timeout_cb(void *arg)
 {
-	_tls_upstream *upstream = (_tls_upstream *)arg;
-	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_READ, 
-	             __FUNC__, upstream->super.fd);
-}
+	_stateful_upstream *self = (_stateful_upstream *)arg;
 
-static int tls_do_handshake(_tls_upstream *upstream);
+	if (!arg) return;
+	GETDNS_CLEAR_EVENT(self->loop, &self->event);
+	UPSTREAM_ERRED(&self->super);
+}
 
 static void
 tls_handshake_cb(void *arg)
 {
 	_tls_upstream *upstream = (_tls_upstream *)arg;
+	uint64_t now_ms = 0;
+	int r;
+
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
 	             __FUNC__, upstream->super.fd);
 
-	int r = tls_do_handshake(upstream);
+	r = tls_do_handshake(upstream, &now_ms);
+
+	DEBUG_STUB( "%s %-35s: FD:  %d, tls_do_handshake returned %d\n"
+	          , STUB_DEBUG_SETUP_TLS, __FUNC__, upstream->super.fd, r);
 
 	if (r == GETDNS_RETURN_GOOD || r == STUB_TCP_RETRY)
 		return;
+
 	UPSTREAM_ERRED(&upstream->super.super);
 }
 
 static int
-tls_do_handshake(_tls_upstream *upstream)
+tls_do_handshake(_tls_upstream *upstream, uint64_t *now_ms)
 {
 	int r;
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
@@ -889,19 +1067,29 @@ tls_do_handshake(_tls_upstream *upstream)
 
 	ERR_clear_error();
 	if ((r = SSL_do_handshake(upstream->tls_obj)) != 1) {
-		DEBUG_STUB("SSL_do_handshake() returned %d\n", r);
 		int want = SSL_get_error(upstream->tls_obj, r);
-		DEBUG_STUB("WANT is: %s\n", ERR_error_string(r, NULL));
 		switch (want) {
-		case SSL_ERROR_WANT_READ:
 		case SSL_ERROR_WANT_WRITE:
-			DEBUG_STUB("WANT something\n");
+			DEBUG_STUB("WANT HS WRITE\n");
+			GETDNS_CLEAR_EVENT(
+			    upstream->super.loop, &upstream->super.event);
+			upstream->super.event.read_cb  = NULL;
+			upstream->super.event.write_cb = tls_handshake_cb;
+			upstream->super.event.timeout_cb = tls_hs_timeout_cb;
+			GETDNS_SCHEDULE_EVENT(upstream->super.loop,
+			    upstream->super.fd, TIMEOUT_TLS, &upstream->super.event);
+			upstream->tls_hs_state = GETDNS_HS_WRITE;
+			return STUB_TCP_RETRY;
+
+		case SSL_ERROR_WANT_READ:
+			DEBUG_STUB("WANT HS READ\n");
 			GETDNS_CLEAR_EVENT(
 			    upstream->super.loop, &upstream->super.event);
 			upstream->super.event.read_cb  = tls_handshake_cb;
-			upstream->super.event.write_cb = tls_handshake_cb;
+			upstream->super.event.write_cb = NULL;
 			GETDNS_SCHEDULE_EVENT(upstream->super.loop,
 			    upstream->super.fd, TIMEOUT_TLS, &upstream->super.event);
+			upstream->super.event.timeout_cb = tls_hs_timeout_cb;
 			upstream->tls_hs_state = GETDNS_HS_READ;
 			return STUB_TCP_RETRY;
 		default:
@@ -926,31 +1114,23 @@ tls_do_handshake(_tls_upstream *upstream)
 		SSL_SESSION_free(upstream->tls_session);
 	upstream->tls_session = SSL_get1_session(upstream->tls_obj);
 	/* Reset timeout on success*/
-	GETDNS_CLEAR_EVENT(upstream->super.loop, &upstream->super.event);
-	GETDNS_SCHEDULE_EVENT(
-	    upstream->super.loop, upstream->super.fd, TIMEOUT_FOREVER,
-	    getdns_eventloop_event_init(&upstream->super.event, upstream,
-	    tls_read_cb, tls_write_cb, NULL));
 
-	return GETDNS_RETURN_GOOD;
+	GETDNS_CLEAR_EVENT(upstream->super.loop, &upstream->super.event);
+
+	return UPSTREAM_RUN(&upstream->super.super, now_ms);
+
 }
 
 static int
-tls_connected(_tls_upstream* upstream, getdns_eventloop *loop)
+tls_connected(_tls_upstream *upstream, getdns_eventloop *loop, uint64_t *now_ms)
 {
 	int r;
 	getdns_context *context = _up_context(&upstream->super.super);
-	_doh_upstream  *self_doh;
 	SSL_CTX        *tls_ctx;
 
 	DEBUG_STUB("%s %-35s: FD:  %d \n", STUB_DEBUG_SETUP_TLS, 
 	             __FUNC__, upstream->super.fd);
 
-	if (upstream->super.loop != loop) {
-		upstream->super.loop = loop;
-		upstream->super.is_sync_loop =
-		    context && &context->sync_eventloop.loop == loop;
-	}
 	/* Already have a TLS connection*/
 	if (upstream->tls_hs_state == GETDNS_HS_DONE)
 		return GETDNS_RETURN_GOOD;
@@ -961,33 +1141,20 @@ tls_connected(_tls_upstream* upstream, getdns_eventloop *loop)
 	if (upstream->tls_hs_state == GETDNS_HS_FAILED)
 		return STUB_TRY_NEXT_UPSTREAM;
 
+	if (upstream->super.loop != loop) {
+		upstream->super.loop = loop;
+		upstream->super.is_sync_loop =
+		    context && &context->sync_eventloop.loop == loop;
+	}
+
 	/* Lets make sure the TCP connection is up before we try a handshake 
 	 * STUB_TCP_RETRY is okay, if we're not yet handshaking
 	 */
 	if ((r = tcp_connected(&upstream->super)) &&
 	    (r != STUB_TCP_RETRY || upstream->tls_hs_state != GETDNS_HS_NONE))
 		return r;
-	DEBUG_STUB("TCP_CONNECTED Returned: %d\n", r);
 
-	tls_ctx = NULL;
-	if ((self_doh = as_doh_up(&upstream->super.super))) {
-		DEBUG_STUB("%s %-35s: FD:  %d DoH tls_ctx setup\n",
-		    STUB_DEBUG_SETUP_TLS, __FUNC__, upstream->super.fd);
-
-		if ( !self_doh->tls_ctx &&
-		    !(self_doh->tls_ctx = SSL_CTX_new(SSLv23_client_method())))
-			return GETDNS_RETURN_IO_ERROR;
-
-		tls_ctx = self_doh->tls_ctx;
-		SSL_CTX_set_options(tls_ctx,
-		    SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
-		    SSL_OP_NO_COMPRESSION |
-		    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
-		SSL_CTX_set_next_proto_select_cb(
-		    tls_ctx, select_next_proto_cb, upstream);
-		SSL_CTX_set_alpn_protos(tls_ctx, (const unsigned char *) "\x02h2", 3);	
-
-	} else if (!(tls_ctx = context ? context->tls_ctx : NULL))
+	if (!(tls_ctx = UPSTREAM_SETUP_TLS_CTX(&upstream->super.super)))
 		return GETDNS_RETURN_IO_ERROR;
 
 	if (!upstream->tls_obj) {
@@ -1007,88 +1174,133 @@ tls_connected(_tls_upstream* upstream, getdns_eventloop *loop)
 		}
 
 		SSL_set_connect_state(upstream->tls_obj);
-		//(void) SSL_set_mode(upstream->tls_obj, SSL_MODE_ASYNC);
+		/* (void) SSL_set_mode(upstream->tls_obj, SSL_MODE_AUTO_RETRY); */
 
 		if (upstream->tls_session != NULL) {
 			/* TODO: The whole authentication stuff (see stub.c) */
 			SSL_set_session(upstream->tls_obj, upstream->tls_session);
 		}
 	}
-	return tls_do_handshake(upstream);
+	return tls_do_handshake(upstream, now_ms);
+}
+
+static SSL_CTX *_tls_setup_tls_ctx(_getdns_upstream *self_up)
+{
+	getdns_context *context;
+
+	if (!(context = _up_context(self_up)))
+		return NULL;
+	return context->tls_ctx;
 }
 
 static int
 _tls_submit(_getdns_upstream *self_up,
     getdns_network_req *netreq, uint64_t *now_ms)
 {
-	_tls_upstream     *self = as_tls_up(self_up);
-	_getdns_upstreams *ups;
+	_tls_upstream *self = as_tls_up(self_up);
 	int r;
 
-	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
-	           (void*)netreq, netreq->request_type);
+	DEBUG_STUB("%s(%s - %s) %-35s: MSG: %p TYPE: %d\n"
+	          , STUB_DEBUG_ENTRY, UPSTREAM_GET_NAME(self_up)
+		  , UPSTREAM_GET_TRANSPORT_NAME(self_up), __FUNC__
+		  , (void*)netreq, netreq->request_type);
 
-	if (!netreq)
-		return STUB_FATAL_ERROR;
 	if (!self)
 		return STUB_TRY_NEXT_UPSTREAM;
 
-	if ((r = tls_connected(self, netreq->owner->loop)) &&
+	if (!netreq)
+		return UPSTREAM_START(self_up, now_ms);
+
+	assert(netreq->gup.current == self_up);
+	if ((r = tls_connected(self, netreq->owner->loop, now_ms)) &&
 	    r != STUB_TCP_RETRY)
 		return r;
 
-	/* Ok, this upstream is fit to try at least.
-	 * First try to schedule the timeout ...
-	 */
-	if (!netreq->event.ev &&
-	    GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
-	    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
-	     getdns_eventloop_event_init(
-	    &netreq->event, netreq, NULL, NULL, netreq_timeout_cb)))
-		return STUB_FATAL_ERROR;
+	if (self->super.connected) {
+		assert(!netreq->event.ev);
 
-	/* Then register the netreq */
-	if (put_netreq_on_waiting_queue(netreq))
-		return STUB_FATAL_ERROR;
-
-	/* Start scheduling writing netreqs if the handshake was finished,
-	 * and there are netreqs on the waiting queue.
-	 */
-	if (self->tls_hs_state == GETDNS_HS_DONE &&
-	    (ups = _up_upstreams(self_up)) &&
-	    ups->waiting[self_up->may & CAP_TRANS].head &&
-	    ( !self->super.event.ev || !self->super.event.write_cb)) {
-
-		if (self->super.event.ev)
-			GETDNS_CLEAR_EVENT(self->super.loop, &self->super.event);
-
-		return GETDNS_SCHEDULE_EVENT(
-		    self->super.loop, self->super.fd, TIMEOUT_FOREVER,
-		    getdns_eventloop_event_init(&self->super.event, self,
-		    tls_read_cb, tls_write_cb, NULL));
+		if (!(r = UPSTREAM_SEND(self_up, netreq, now_ms)))
+			r = GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
+			    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
+			    getdns_eventloop_event_init(&netreq->event, netreq, NULL, NULL, netreq_timeout_cb));
+		return r;
 	}
-	return GETDNS_RETURN_GOOD;
+	/* Not connected, so connecting... put on waiting queue */
+	if ((r = GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
+	    _getdns_ms_until_expiry2(netreq->owner->expires, now_ms),
+	    getdns_eventloop_event_init(&netreq->event, netreq, NULL, NULL, netreq_timeout_cb))))
+		return r;
+
+	register_processing(self_up);
+	return put_netreq_on_waiting_queue(netreq);
 }
+
+static int _tls_start(_getdns_upstream *self_up, uint64_t *now_ms)
+{
+	int r;
+	_tls_upstream *self = as_tls_up(self_up);
+
+	DEBUG_STUB("%s %-35s\n", STUB_DEBUG_ENTRY, __FUNC__);
+
+	if (!self->super.loop)
+		return GETDNS_RETURN_IO_ERROR;
+
+	else if ((r = tls_connected(self, self->super.loop, now_ms)))
+		return r;
+
+	else if (self->super.connected)
+		return send_from_waiting_queue(self_up, now_ms);
+	else
+		return GETDNS_RETURN_GOOD;
+}
+
+static int
+_tls_run(_getdns_upstream *self_up, uint64_t *now_ms)
+{
+	_tls_upstream *self = as_tls_up(self_up);
+
+	self->super.connected = 1;
+	UP_INFO(self_up, "Connected", 0);
+	return send_from_waiting_queue(self_up, now_ms);
+}
+
+
+typedef struct _doh_upstream {
+	_tls_upstream super;
+	
+	/* settings */
+	char                     uri[4096];
+	nghttp2_session         *session;
+
+	_tsig_st                 tsig;
+
+	/* state */
+	SSL_CTX                 *tls_ctx;
+} _doh_upstream;
+
+static inline _doh_upstream *as_doh_up(_getdns_upstream *up)
+{ return up && up->vmt == &_doh_vmt ? (_doh_upstream *)up : NULL; }
 
 static void _doh_cleanup(_getdns_upstream *self_up)
 {
 	struct mem_funcs  *mfs;
-
-	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self_up);
-	if ((mfs = priv_getdns_context_mf(_up_context(self_up))))
-		GETDNS_FREE(*mfs, self_up);
-}
-
-static const struct sockaddr *
-_doh_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
-{
 	_doh_upstream *self = as_doh_up(self_up);
 
-	if (self) {
-		if (addrlen) *addrlen = self->addr_len;
-		return (struct sockaddr *)&self->addr;
+	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self_up);
+
+	if (!self)
+		return;
+	if (self->session) {
+		nghttp2_session_del(self->session);
+		self->session = NULL;
 	}
-	return NULL;
+	_tls_cleanup(self_up);
+	if (self->tls_ctx) {
+		SSL_CTX_free(self->tls_ctx);
+		self->tls_ctx = NULL;
+	}
+	if ((mfs = priv_getdns_context_mf(_up_context(self_up))))
+		GETDNS_FREE(*mfs, self_up);
 }
 
 static const char *
@@ -1098,19 +1310,152 @@ _doh_get_name(_getdns_upstream *self_up)
 	return self ? self->uri : NULL;
 }
 
-static void _doh_set_port(_getdns_upstream *self_up, uint32_t port)
+static int
+select_next_proto_cb(SSL * ssl, unsigned char **out,
+    unsigned char *outlen, const unsigned char *in, unsigned int inlen, void *arg)
+{
+	_stateful_upstream *up = (_stateful_upstream *)arg;
+	(void) ssl;
+
+	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
+	             __FUNC__, up->fd);
+
+	if (nghttp2_select_next_protocol(out, outlen, in, inlen) <= 0)
+		UPSTREAM_ERRED(&up->super);
+		
+	return SSL_TLSEXT_ERR_OK;
+}
+
+static SSL_CTX *
+_doh_setup_tls_ctx(_getdns_upstream *self_up)
+{
+	_doh_upstream *self;
+
+	if (!(self = as_doh_up(self_up)))
+		return NULL;
+
+	DEBUG_STUB("%s %-35s: FD:  %d DoH tls_ctx setup\n",
+	    STUB_DEBUG_SETUP_TLS, __FUNC__, self->super.super.fd);
+
+	if ( !self->tls_ctx &&
+	    !(self->tls_ctx = SSL_CTX_new(SSLv23_client_method())))
+		return NULL;
+
+	SSL_CTX_set_options(self->tls_ctx,
+	    SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+	    SSL_OP_NO_COMPRESSION |
+	    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+	SSL_CTX_set_next_proto_select_cb(
+	    self->tls_ctx, select_next_proto_cb, self);
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(HAVE_LIBRESSL)
+	SSL_CTX_set_alpn_protos(self->tls_ctx, (const unsigned char *) "\x02h2", 3);
+#endif /* OPENSSL_VERSION_NUMBER >= 0x10002000L */
+	return self->tls_ctx;
+}
+
+static void
+_doh_write_cb(void *arg)
+{
+	_doh_upstream *self = (_doh_upstream *)arg;
+	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_WRITE, __FUNC__, self->super.super.fd);
+
+	if (nghttp2_session_send(self->session))
+		UPSTREAM_ERRED(&self->super.super.super);
+}
+
+static ssize_t
+send_callback(nghttp2_session *session, const uint8_t *data, size_t length,
+    int flags,  void *user_data)
+{
+	_doh_upstream *self_doh = as_doh_up((_getdns_upstream *)user_data);
+	_stateful_upstream *self;
+	SSL *ssl;
+	int written;
+
+
+	(void)session;
+	(void)flags;
+
+	if (!self_doh)
+		return NGHTTP2_ERR_CALLBACK_FAILURE;
+
+
+	self = &self_doh->super.super;
+	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_WRITE, __FUNC__, self->fd);
+	ssl  = self_doh->super.tls_obj;
+
+	written = SSL_write(ssl, data, (int)length);
+	if (written > 0)
+		return (ssize_t)written;
+
+	switch (SSL_get_error(ssl, written)) {
+	case SSL_ERROR_WANT_READ:
+		if (self->event.ev)
+			GETDNS_CLEAR_EVENT(self->loop, &self->event);
+		GETDNS_SCHEDULE_EVENT(
+		    self->loop, self->fd, TIMEOUT_FOREVER,
+		    getdns_eventloop_event_init(&self->event, self,
+		    _doh_write_cb, NULL, NULL));
+		return NGHTTP2_ERR_WOULDBLOCK;
+
+	case SSL_ERROR_WANT_WRITE:
+		if (self->event.ev)
+			GETDNS_CLEAR_EVENT(self->loop, &self->event);
+		GETDNS_SCHEDULE_EVENT(
+		    self->loop, self->fd, TIMEOUT_FOREVER,
+		    getdns_eventloop_event_init(&self->event, self,
+		    NULL, _doh_write_cb, NULL));
+		return NGHTTP2_ERR_WOULDBLOCK;
+
+	default:
+		return NGHTTP2_ERR_CALLBACK_FAILURE;
+	}
+}
+
+static int
+_doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 {
 	_doh_upstream *self = as_doh_up(self_up);
+	const unsigned char *alpn = NULL;
+	unsigned int alpnlen = 0;
+	int val = 1;
+	nghttp2_session_callbacks *callbacks;
 
 	if (!self)
-		; /* pass */
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-	else if (self->addr.ss_family == AF_INET)
-		((struct sockaddr_in *)(&self->addr))->sin_port = htons(port);
+	SSL_get0_next_proto_negotiated(self->super.tls_obj, &alpn, &alpnlen);
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+	if (alpn == NULL)
+		SSL_get0_alpn_selected(self->super.tls_obj, &alpn, &alpnlen);
+#endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
 
-	else if (self->addr.ss_family == AF_INET6)
-		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
+	if (alpn == NULL || alpnlen != 2 || memcmp("h2", alpn, 2) != 0) {
+		UP_ERR(self_up, "h2 is not negotiaded", 0);
+		return GETDNS_RETURN_IO_ERROR;
+	}
+	setsockopt(self->super.super.fd, IPPROTO_TCP, TCP_NODELAY, (char *)&val, sizeof(val));
+
+	if (nghttp2_session_callbacks_new(&callbacks))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
+	/*
+	nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
+	nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, on_data_chunk_recv_callback);
+	nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, on_stream_close_callback);
+	nghttp2_session_callbacks_set_on_header_callback(callbacks, on_header_callback);
+	nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, on_begin_headers_callback);
+	*/
+	if (nghttp2_session_client_new(&self->session, callbacks, self)) {
+		nghttp2_session_callbacks_del(callbacks);
+		return GETDNS_RETURN_MEMORY_ERROR;
+	}
+	nghttp2_session_callbacks_del(callbacks);
+
+	return _tls_run(self_up, now_ms);
 }
+
 
 typedef struct _address_upstream {
 	_getdns_upstream         super;
@@ -1157,14 +1502,23 @@ static void _address_set_port(_getdns_upstream *self_up, uint32_t port)
 		((struct sockaddr_in *)(&self->addr))->sin_port = htons(port);
 
 	else if (self->addr.ss_family == AF_INET6)
-		((struct sockaddr_in6 *)(&self->addr))->sin6_port = htons(port);
+		((struct sockaddr_in6 *)(&self->addr))->sin6_port =
+		    htons(port);
 }
 
 static void _address_set_tls_port(_getdns_upstream *self_up, uint32_t port)
 {
 	_address_upstream *self = as_address_up(self_up);
 
-	if (self) self->tls.tls_port = port;
+	if (!self)
+	       ;
+	else if (self->tls.addr.ss_family == AF_INET)
+		((struct sockaddr_in *)(&self->tls.addr))->sin_port =
+		    htons(port);
+
+	else if (self->tls.addr.ss_family == AF_INET6)
+		((struct sockaddr_in6 *)(&self->tls.addr))->sin6_port =
+		    htons(port);
 }
 
 static getdns_return_t _address_as_dict(
@@ -1227,11 +1581,20 @@ static getdns_return_t _address_as_dict(
 		r = GETDNS_RETURN_NOT_IMPLEMENTED;
 		break;
 	}
-	if (!r) do {
-		if (self->tls.tls_port != 853 &&
-		    (r = getdns_dict_set_int(dict, "tls_port", (uint32_t)self->tls.tls_port)))
-			break;
-	} while(0);
+	if (!r) {
+		switch (self->tls.addr.ss_family) {
+		case AF_INET : port = ntohs(((struct sockaddr_in *)
+		                             (&self->addr))->sin_port);
+		               break;
+		case AF_INET6: port = ntohs(((struct sockaddr_in6 *)
+                                             (&self->tls.addr))->sin6_port);
+		               break;
+		default      : port = 853;
+		               break;
+		}
+		if (port != 853)
+			r = getdns_dict_set_int(dict, "tls_port", port);
+	};
 	if (r) {
 		getdns_dict_destroy(dict);
 		return r;
@@ -1260,23 +1623,29 @@ _address_get_addr(_getdns_upstream *self_up, socklen_t *addrlen)
 	return NULL;
 }
 
-static void
+static int
 _address_start(_getdns_upstream *self, uint64_t *now_ms)
 {
 	_getdns_upstream *start, *child;
+	int r = GETDNS_RETURN_GOOD;
 
 	if (!self)
-		return;
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
 	DEBUG_STUB("Start upstream %p for %s with transport %s\n",
 	    (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self));
 
 	start = child = self->children;
 	while (child) {
-		child->vmt->start(child, now_ms);
+		int c_r;
+		
+		if ((c_r = UPSTREAM_START(child, now_ms)) && !r)
+			r = c_r;
+
 		if ((child = child->next) == start)
 			break;
 	}
+	return r;
 }
 
 static getdns_return_t
@@ -1309,7 +1678,7 @@ _getdns_create_address_upstream(struct mem_funcs *mfs,
 
 	_udp_upstream_init(&up->udp);
 	_tcp_upstream_init(&up->tcp);
-	_tls_upstream_init(&up->tls);
+	_tls_upstream_init(&up->tls, ai, 853);
 
 	(void) strlcpy(up->addr_str, addr_str, sizeof(up->addr_str));
 
@@ -1342,7 +1711,7 @@ typedef struct _named_upstream {
 
 static inline _named_upstream *as_named_up(_getdns_upstream *up)
 { return up && (  up->vmt == &_named_vmt
-               || up->vmt == &_doh_uri_vmt) ? (_named_upstream *)up : NULL; }
+               || up->vmt == &_doh_uri_vmt ) ? (_named_upstream *)up : NULL; }
 
 typedef struct _doh_uri_upstream {
 	_named_upstream super;
@@ -1373,15 +1742,16 @@ _getdns_append_doh_upstream(_getdns_upstream *parent_up,
 		return GETDNS_RETURN_MEMORY_ERROR;
 
 	(void) memset(up, 0, sizeof(*up));
-	_tls_upstream_init(&up->super);
-	up->super.tls_port = 443;
+	_tls_upstream_init(&up->super, ai, 443);
 	up->super.super.super.vmt = &_doh_vmt;
 	(void)snprintf(up->uri, sizeof(up->uri),
 	    "https://%s/%s", addr_str, parent->path);
+	up->session = NULL;
+	if (parent->super.req_a)
+		up->super.super.loop = parent->super.req_a->owner->loop;
+	else if (parent->super.req_aaaa)
+		up->super.super.loop = parent->super.req_aaaa->owner->loop;
 
-	up->addr_len = ai->ai_addrlen;
-	(void) memcpy(&up->addr, ai->ai_addr, ai->ai_addrlen);
-	up->addr.ss_family = ai->ai_family;
 	up->tsig.tsig_alg = GETDNS_NO_TSIG;
 
 	_upstream_append(parent_up, &up->super.super.super);
@@ -1390,16 +1760,84 @@ _getdns_append_doh_upstream(_getdns_upstream *parent_up,
 	return GETDNS_RETURN_GOOD;
 }
 
-static void _named_address_answer_cb(
-    _named_upstream *self, getdns_network_req **netreq,
+static getdns_return_t
+_named_equip(_getdns_upstream *self_up, int af, const uint8_t *addr,
+    _getdns_upstream **new_upstream)
+{
+	_named_upstream *self = as_named_up(self_up);
+	char             a_buf[40];
+	getdns_return_t  r;
+
+	if (!self)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+   
+	if (!inet_ntop(af, addr, a_buf, sizeof(a_buf))) {
+		/* TODO: Log reason (family not supported, or no space) */
+		return GETDNS_RETURN_INVALID_PARAMETER;
+	}
+	DEBUG_STUB("Address lookup (for named upstream): %s\n", a_buf);
+
+	if ((r = _getdns_append_upstream(self_up, a_buf, new_upstream)))
+		/* TODO: Log something? */
+		return r;
+
+	if (self->port != 53)
+		(*new_upstream)->vmt->set_port(*new_upstream, self->port);
+
+	if (self->tls_port != 853)
+		(*new_upstream)->vmt->set_tls_port(*new_upstream, self->tls_port);
+
+	return GETDNS_RETURN_GOOD;
+}
+
+static getdns_return_t
+_doh_uri_equip(_getdns_upstream *self_up, int af, const uint8_t *addr,
+    _getdns_upstream **new_upstream)
+{
+	_doh_uri_upstream *self = as_doh_uri_up(self_up);
+	char               a_buf[40];
+	struct addrinfo    hints;
+	struct addrinfo   *ai = NULL;
+	getdns_return_t     r;
+
+	if (!self)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!inet_ntop(af, addr, a_buf, sizeof(a_buf))) {
+		/* TODO: Log reason (family not supported, or no space) */
+		return GETDNS_RETURN_INVALID_PARAMETER;
+	}
+	DEBUG_STUB("Address lookup (for DoH): %s\n", a_buf);
+
+	(void) memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family    = AF_UNSPEC;      /* IPv4 or IPv6 */
+	hints.ai_flags     = AI_NUMERICHOST; /* No reverse lookups */
+
+	if (getaddrinfo(a_buf, "443", &hints, &ai))
+		/* TODO: log getaddrinfo error */
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	else if ((r = _getdns_append_doh_upstream(
+	    self_up, ai, a_buf, new_upstream)))
+		; /* TODO: do something with append doh_upstream error? */
+
+	else if (self->super.port != 443)
+		(*new_upstream)->vmt->set_port(*new_upstream, self->super.port);
+
+	if (ai) freeaddrinfo(ai);
+	return r;
+}
+
+static void
+_named_address_answer_cb(_named_upstream *self, getdns_network_req **netreq,
     size_t addrlen, int af)
 {
 	_getdns_rrset_spc    rrset_spc;
 	_getdns_rrset       *rrset;
 	_getdns_rrtype_iter  rr_spc;
 	_getdns_rrtype_iter *rr;
-	char                 a_buf[40];
 	upstream_caps        had_caps;
+	uint64_t             now_ms = 0;
 
 	DEBUG_STUB("%s %-35s: MSG: %p TYPE: %d\n", STUB_DEBUG_ENTRY, __FUNC__,
 	           (void*)*netreq, (*netreq)->request_type);
@@ -1412,50 +1850,14 @@ static void _named_address_answer_cb(
 	         ; rr ; rr = _getdns_rrtype_iter_next(rr)) {
 		_getdns_upstream *new_upstream;
 
-		 if (rr->rr_i.nxt - rr->rr_i.rr_type != (int)(10 + addrlen))
-			 continue;
-		(void) inet_ntop(af, rr->rr_i.rr_type + 10, a_buf, sizeof(a_buf));
+		if (rr->rr_i.nxt - rr->rr_i.rr_type != (int)(10 + addrlen))
+			continue;
 
-		/* TODO: Replace this with pass in native address data */
-		if (self->super.vmt == &_doh_uri_vmt) {
-			struct addrinfo   hints;
-			struct addrinfo  *ai = NULL;
-
-			DEBUG_STUB("Address lookup (for DoH): %s\n", a_buf);
-
-			(void) memset(&hints, 0, sizeof(struct addrinfo));
-			hints.ai_family    = AF_UNSPEC;      /* IPv4 or IPv6 */
-			hints.ai_flags     = AI_NUMERICHOST; /* No reverse lookups */
-
-			if (getaddrinfo(a_buf, "443", &hints, &ai))
-				; /* TODO: log getaddrinfo error */
-			else if (_getdns_append_doh_upstream(
-			    &self->super, ai, a_buf, &new_upstream))
-				; /* TODO: do something with append doh_upstream error? */
-			else {
-				uint64_t now_ms = 0;
-
-				if (self->port != 443)
-					new_upstream->vmt->set_port(new_upstream, self->port);
-
-				new_upstream->vmt->start(new_upstream, &now_ms);
-			}
-			if (ai) freeaddrinfo(ai);
-
-		} else if (!_getdns_append_upstream(
-		    &self->super, a_buf, &new_upstream)) {
-			uint64_t now_ms = 0;
-
-			DEBUG_STUB("Address lookup (for named upstream): %s\n", a_buf);
-
-			if (self->port != 53)
-				new_upstream->vmt->set_port(new_upstream, self->port);
-			if (self->tls_port != 853)
-				new_upstream->vmt->set_tls_port(
-				    new_upstream, self->tls_port);
-
-			new_upstream->vmt->start(new_upstream, &now_ms);
-		}
+		if (UPSTREAM_EQUIP(
+		    &self->super, af, rr->rr_i.rr_type + 10 , &new_upstream))
+			; /* TODO: log equip error? */
+		else
+			UPSTREAM_START(new_upstream, &now_ms);
 	}
 	_getdns_context_cancel_request((*netreq)->owner);
 	*netreq = NULL; /* netreq is either &self->req_a or &self->req_aaaa */
@@ -1475,18 +1877,22 @@ static void _named_address_answer_cb(
 	/* Nothing more to expect from this upstream.  (i.e. it's address
 	 * children should start picking up requests from the waiting queues)
 	 */
-	decrement_transport_processing(_up_upstreams(&self->super), had_caps);
+	deregister_processing(&self->super, had_caps);
 }
 
 static void _named_a_answer_cb(getdns_dns_req *dnsreq)
 {
 	_named_upstream     *self = (_named_upstream *)dnsreq->user_pointer;
+
+	if (!self) return;
 	_named_address_answer_cb(self, &self->req_a, 4, AF_INET);
 }
 
 static void _named_aaaa_answer_cb(getdns_dns_req *dnsreq)
 {
 	_named_upstream     *self = (_named_upstream *)dnsreq->user_pointer;
+
+	if (!self) return;
 	_named_address_answer_cb(self, &self->req_aaaa, 16, AF_INET6);
 }
 
@@ -1545,8 +1951,7 @@ static int _named_submit(
 		 * entry, register as processing for our transports.
 		 */
 		if (!resolving)
-			increment_transport_processing(
-			    _up_upstreams(self_up), self_up->may);
+			register_processing(self_up);
 
 		if (!netreq->event.ev &&
 		    GETDNS_SCHEDULE_EVENT(netreq->owner->loop, -1,
@@ -1655,7 +2060,7 @@ _named_upstream_init(_named_upstream *up, const char *name)
 {
 	(void) memset(up, 0, sizeof(*up));
 	up->super.vmt = &_named_vmt;
-	up->super.may = (CAP_MIGHT     & ((CAP_RESOLVED|CAP_CONNECTED)
+	up->super.may = (CAP_MIGHT     & ((CAP_RESOLVED)
 	                                  ^ 0xFFFF))
 	              |  CAP_STATELESS |  CAP_UNENCRYPTED
 		      |  CAP_STATEFUL  |  CAP_ENCRYPTED;
@@ -1996,9 +2401,8 @@ _udp_write_cb(void *userarg)
 	}
 }
 
-static void _udp_start(_getdns_upstream *self_up, uint64_t *now_ms);
 static int
-_udp_submit(_getdns_upstream *self_up,
+_udp_send(_getdns_upstream *self_up,
     getdns_network_req *netreq, uint64_t *now_ms)
 {
 	_stateless_upstream *self = as_udp_up(self_up);
@@ -2011,10 +2415,9 @@ _udp_submit(_getdns_upstream *self_up,
 	if (!self)
 		return STUB_TRY_NEXT_UPSTREAM;
 
-	if (!netreq) {
-		_udp_start(self_up, now_ms);
-		return GETDNS_RETURN_GOOD;
-	}
+	if (!netreq)
+		return send_from_waiting_queue(self_up, now_ms);
+
 	if (  self->to_retry <= 0 &&
 	    ++self->to_retry <= 0)
 		return STUB_TRY_NEXT_UPSTREAM;
@@ -2042,67 +2445,6 @@ _udp_submit(_getdns_upstream *self_up,
 		     NULL, _udp_write_cb, netreq_timeout_cb));
 }
 
-static void
-_udp_start(_getdns_upstream *self_up, uint64_t *now_ms)
-{
-	_getdns_upstreams   *ups;
-	const upstream_caps *i;
-	getdns_network_req  *prev_n;
-
-	DEBUG_STUB("%s %-35s\n", STUB_DEBUG_ENTRY, __FUNC__);
-
-	if (!(ups = _up_upstreams(self_up)))
-		return;
-
-	DEBUG_STUB("%s %-35s: UPS: %p\n", STUB_DEBUG_ENTRY, __FUNC__, (void *)ups);
-	/* All transports for this upstream.
-	 * (should be only STATELESS|UNENCRYPTED realisticly, but alas)
-	 */
-	for (i = all_trans_caps; *i; i++) {
-		getdns_network_req *netreq;
-
-		if ((self_up->may & *i) != *i)
-			continue;
-
-		DEBUG_STUB("%s %-35s: suitable cap-transport found: %d\n",
-		     STUB_DEBUG_ENTRY, __FUNC__, *i);
-		prev_n = NULL;
-		netreq = ups->waiting[*i].head;
-		while (netreq) {
-			DEBUG_STUB("%s %-35s: MSG: %p \n", STUB_DEBUG_ENTRY, __FUNC__, (void *)netreq);
-
-			if (!_upstream_cap_complies(netreq->gup.cap, self_up->may)
-			||  _udp_submit(self_up, netreq, now_ms)) {
-				/* Netreq not complient with this upstream or
-				 * failed to submit.  Try next on this queue.
-				 */
-				prev_n = netreq;
-				netreq = netreq->next;
-				continue;
-			}
-			/* Netreq sucessfully submitted!
-			 */
-			netreq->gup.current = self_up;
-			if (!netreq->gup.stop_at)
-				netreq->gup.stop_at = self_up;
-
-			if (ups->waiting[*i].last == netreq)
-				ups->waiting[*i].last = prev_n;
-
-			if (!prev_n) {
-				ups->waiting[*i].head = netreq->next;
-				netreq->next = NULL;
-				netreq = ups->waiting[*i].head;
-			} else {
-				prev_n->next = netreq->next;
-				netreq->next = NULL;
-				netreq = prev_n->next;
-			}
-		}
-	}
-}
-
-
 getdns_return_t
 _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 {
@@ -2114,10 +2456,13 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 
 	/* Find upstream for current transport */
 	while ((up = netreq_next_upstream(netreq))) {
-		switch (UPSTREAM_SUBMIT(up, netreq, now_ms)) {
-		case GETDNS_RETURN_GOOD:
+		int r = UPSTREAM_SUBMIT(up, netreq, now_ms);
+
+		if (r != STUB_TRY_AGAIN_LATER)
 			upstream_set_visited(
 			    &netreq->owner->my_mf, &netreq->gup, up);
+		switch (r) {
+		case GETDNS_RETURN_GOOD:
 			return GETDNS_RETURN_GOOD;
 
 		case STUB_TRY_AGAIN_LATER:
@@ -2137,8 +2482,6 @@ _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms)
 
 		default:
 			/* Not submitted, so no revoke needed */
-			upstream_set_visited(
-			    &netreq->owner->my_mf, &netreq->gup, up);
 			UPSTREAM_ERRED(up);
 			continue; /* Try next upstream */
 		}
@@ -2185,14 +2528,34 @@ static int _nop_submit(
 { (void)self; (void)netreq; (void)now_ms
 ; DEBUG_STUB("Submit netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self))
 ; return GETDNS_RETURN_NOT_IMPLEMENTED; }
-static void _nop_start(_getdns_upstream *self, uint64_t *now_ms)
+static int _nop_start(_getdns_upstream *self, uint64_t *now_ms)
 { (void)self; (void)now_ms
-; DEBUG_STUB("Start upstream %p for %s with transport %s\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
+; DEBUG_STUB("Start upstream %p for %s with transport %s\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self))
+; return GETDNS_RETURN_NOT_IMPLEMENTED; }
 
 static void _nop_revoke(_getdns_upstream *self, getdns_network_req *netreq)
 { (void)self; (void)netreq; ; DEBUG_STUB("Revoke netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self)); }
 static void _nop_erred(_getdns_upstream *self)
 { (void)self; DEBUG_STUB("Upstream %p for %s with transport %s erred\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self)); }
+
+static int _nop_send(
+    _getdns_upstream *self, getdns_network_req *netreq, uint64_t *now_ms)
+{ (void)self; (void)netreq; (void)now_ms
+; DEBUG_STUB("Send netreq %p with transport %s on upstream %p for %s\n", (void *)netreq, UPSTREAM_GET_TRANSPORT_NAME(self), (void *)self, UPSTREAM_GET_NAME(self))
+; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+static int _nop_run(_getdns_upstream *self, uint64_t *now_ms)
+{ (void)self; (void)now_ms;
+; DEBUG_STUB("Start_processing upstream %p for %s with transport %s\n", (void *)self, UPSTREAM_GET_NAME(self), UPSTREAM_GET_TRANSPORT_NAME(self));
+; return GETDNS_RETURN_NOT_IMPLEMENTED; }
+
+static getdns_return_t _nop_equip(_getdns_upstream *self_up,
+    int af, const uint8_t *addr, _getdns_upstream **new_upstream)
+{ (void)self_up; (void)new_upstream; (void)af; (void)addr;
+; assert(0); return GETDNS_RETURN_NOT_IMPLEMENTED; }
+
+static SSL_CTX *_nop_setup_tls_ctx(_getdns_upstream *self)
+{ (void)self; return NULL; }
+
 
 static void _set_parent_port(_getdns_upstream *self, uint32_t port)
 {
@@ -2225,7 +2588,7 @@ static const char *_tcp_get_transport_name(_getdns_upstream *self)
 static const char *_tls_get_transport_name(_getdns_upstream *self)
 { (void)self; return "TLS"; }
 
-static _getdns_upstream_vmt _base_vmt = {
+static _getdns_upstream_vmt _upstreams_vmt = {
 	_nop_cleanup,
 	_nop_uint32_t,
 	_nop_uint32_t,
@@ -2235,9 +2598,14 @@ static _getdns_upstream_vmt _base_vmt = {
 	_nop_get_transport_name,
 
 	_nop_submit,
+	_nop_send,
 	_nop_start,
+	_nop_run,
 	_nop_revoke,
 	_nop_erred,
+
+	_nop_equip,
+	_nop_setup_tls_ctx
 };
 static _getdns_upstream_vmt   _address_vmt = {
 	_address_cleanup,
@@ -2249,11 +2617,16 @@ static _getdns_upstream_vmt   _address_vmt = {
 	_nop_get_transport_name,
 
 	_nop_submit,
+	_nop_send,
 	_address_start,
+	_nop_run,
 	_nop_revoke,
 	_nop_erred,
+
+	_nop_equip,
+	_nop_setup_tls_ctx
 };
-static _getdns_upstream_vmt   _named_vmt = {
+static _getdns_upstream_vmt _named_vmt = {
 	_named_cleanup,
 	_named_set_port,
 	_named_set_tls_port,
@@ -2263,11 +2636,16 @@ static _getdns_upstream_vmt   _named_vmt = {
 	_nop_get_transport_name,
 
 	_named_submit,
+	_nop_send,
 	_nop_start,
+	_nop_run,
 	_named_revoke,
 	_named_erred,
+
+	_named_equip,
+	_nop_setup_tls_ctx
 };
-static _getdns_upstream_vmt   _doh_uri_vmt = {
+static _getdns_upstream_vmt _doh_uri_vmt = {
 	_named_cleanup,
 	_named_set_port,
 	_named_set_port,
@@ -2277,9 +2655,14 @@ static _getdns_upstream_vmt   _doh_uri_vmt = {
 	_doh_get_transport_name,
 
 	_named_submit,
+	_nop_send,
 	_nop_start,
+	_nop_run,
 	_named_revoke,
 	_named_erred,
+
+	_doh_uri_equip,
+	_nop_setup_tls_ctx
 };
 static _getdns_upstream_vmt       _udp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
@@ -2290,12 +2673,17 @@ static _getdns_upstream_vmt       _udp_vmt = {
 	_get_parent_addr,
 	_udp_get_transport_name,
 
-	_udp_submit,
-	_udp_start,
+	_udp_send,
+	_udp_send,
+	send_from_waiting_queue,
+	send_from_waiting_queue,
 	_udp_revoke,
 	_udp_erred,
+
+	_nop_equip,
+	_nop_setup_tls_ctx
 };
-static _getdns_upstream_vmt       _tcp_vmt = {
+static _getdns_upstream_vmt  _tcp_vmt = {
 	_nop_cleanup,		/* Handled by _address parent */
 	_set_parent_port,
 	_set_parent_tls_port,
@@ -2305,35 +2693,51 @@ static _getdns_upstream_vmt       _tcp_vmt = {
 	_tcp_get_transport_name,
 
 	_nop_submit,
+	_nop_send,
 	_nop_start,
+	_nop_run,
 	_stateful_revoke,
-	_nop_erred,
+	_upstream_erred,
+
+	_nop_equip,
+	_nop_setup_tls_ctx
 };
-static _getdns_upstream_vmt       _tls_vmt = {
-	_nop_cleanup,		/* Handled by _address parent */
-	_set_parent_port,
-	_set_parent_tls_port,
+static _getdns_upstream_vmt _tls_vmt = {
+	_tls_cleanup,
+	_tls_set_port,
+	_tls_set_port,
 	_nop_as_dict,		/* Handled by _address parent */
 	_get_parent_name,
-	_get_parent_addr,
+	_tls_get_addr,
 	_tls_get_transport_name,
 
 	_tls_submit,
-	_nop_start,
+	_nop_send,
+	_tls_start,
+	_tls_run,
 	_stateful_revoke,
-	_nop_erred,
+	_upstream_erred,
+
+	_nop_equip,
+	_tls_setup_tls_ctx
 };
-static _getdns_upstream_vmt       _doh_vmt = {
+static _getdns_upstream_vmt _doh_vmt = {
 	_doh_cleanup,
-	_doh_set_port,
-	_doh_set_port,
+	_tls_set_port,
+	_tls_set_port,
 	_nop_as_dict,		/* Handled by _doh_uri_parent */
 	_doh_get_name,
-	_doh_get_addr,
+	_tls_get_addr,
 	_doh_get_transport_name,
 
 	_tls_submit,
-	_nop_start,
+	_nop_send,
+	_tls_start,
+	_doh_run,
 	_stateful_revoke,
-	_nop_erred,
+	_upstream_erred,
+
+	_nop_equip,
+	_doh_setup_tls_ctx
 };
+

@@ -148,6 +148,7 @@ netreq_reset(getdns_network_req *net_req)
 	 */
 	// GUPS {
 	(void) memset(&net_req->gup, 0, sizeof(net_req->gup));
+	net_req->stream_id = -1;
 	// } GUPS
 	net_req->first_upstream = NULL;
 	net_req->unbound_id = -1;
