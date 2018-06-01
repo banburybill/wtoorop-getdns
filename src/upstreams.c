@@ -16,7 +16,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL Verisign, Inc. BE LIABLE FOR ANY
+ * DISCLAIMED. IN NO EVENT SHALL NLnet Labs and/or Sinodun. BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
  * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
@@ -101,6 +101,58 @@ _getdns_get_time_as_uintt64() {
 	now = tv.tv_sec * 1000000 + tv.tv_usec;
 	return now;
 }
+
+typedef struct _edns_cookie_st {
+	uint32_t secret;
+	uint8_t  client_cookie[8];
+	uint8_t  prev_client_cookie[8];
+	uint8_t  server_cookie[32];
+
+	unsigned has_client_cookie     : 1;
+	unsigned has_prev_client_cookie: 1;
+	unsigned has_server_cookie     : 1;
+	unsigned server_cookie_len     : 5;
+} _edns_cookie_st;
+
+
+ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
+    getdns_network_req *netreq, _edns_cookie_st *cookie, _tsig_st *tsig)
+{
+	GLDNS_ID_SET(netreq->query, (uint16_t)arc4random());
+	if (netreq->opt) {
+		_getdns_network_req_clear_upstream_options(netreq);
+
+		if (netreq->owner->edns_cookies) {
+			/* TODO: Handle cookies */
+			(void)cookie;
+		}
+
+		if (netreq->owner->edns_client_subnet_private) {
+			const struct sockaddr *addr = UPSTREAM_GET_ADDR(up, NULL);
+
+			/* see https://tools.ietf.org/html/rfc7871#section-7.1.2
+			 * all-zeros is a request to not leak the data further:
+			 * A two byte FAMILY field is a SHOULD even when SOURCE
+			 * and SCOPE are 0.
+			 * "\x00\x02"  FAMILY: 2 for IPv6 upstreams in network byte order, or
+			 * "\x00\x01"  FAMILY: 1 for IPv4 upstreams in network byte order, then:
+			 * "\x00"  SOURCE PREFIX-LENGTH: 0
+			 * "\x00";  SCOPE PREFIX-LENGTH: 0
+			 */
+			if (_getdns_network_req_add_upstream_option(
+			    netreq, GLDNS_EDNS_CLIENT_SUBNET, 4,
+			    ( !addr || addr->sa_family != AF_INET6
+			    ? "\x00\x01\x00\x00" : "\x00\x02\x00\x00" )))
+				return -1;
+		}
+	}
+	if (!tsig || tsig->tsig_alg == GETDNS_NO_TSIG_)
+		return netreq->response - netreq->query;
+
+	return -1; /* TODO: Add tsig option */
+}
+
+
 
 getdns_return_t
 _getdns_submit_stub_request(getdns_network_req *netreq, uint64_t *now_ms);
@@ -527,13 +579,12 @@ deregister_processing(_getdns_upstream *up, upstream_caps cap)
 	}
 }
 
+static inline getdns_context *_up_context(_getdns_upstream *upstream);
 static void _upstream_erred(_getdns_upstream *self)
 {
-	DEBUG_STUB("%s %-35s: UPSTREAM: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)self);
+	assert(self);
 
-	if (!self)
-		return;
-
+	UP_NOTICE(self, "Shutdown because an error occurred\n", 0);
 	deregister_processing(self, self->may);
 }
 
@@ -692,18 +743,6 @@ _upstream_append(_getdns_upstream *parent, _getdns_upstream *child)
 /* Address based upstreams
  *****************************************************************************/
 
-typedef struct _edns_cookie_st {
-	uint32_t secret;
-	uint8_t  client_cookie[8];
-	uint8_t  prev_client_cookie[8];
-	uint8_t  server_cookie[32];
-
-	unsigned has_client_cookie     : 1;
-	unsigned has_prev_client_cookie: 1;
-	unsigned has_server_cookie     : 1;
-	unsigned server_cookie_len     : 5;
-} _edns_cookie_st;
-
 typedef struct _stateless_upstream {
 	_getdns_upstream super;
 
@@ -777,7 +816,7 @@ typedef struct _stateful_upstream {
 	int                     server_keepalive_received;
 
 	/* Management of outstanding requests on stateful transports */
-	_getdns_rbtree_t        netreq_by_query_id;
+	_getdns_rbtree_t        netreq_by_id;
 
 	/* When requests have been scheduled asynchronously on an upstream
 	 * that is kept open, and a synchronous call is then done with the
@@ -798,6 +837,10 @@ typedef struct _stateful_upstream {
 	unsigned                is_sync_loop : 1;
 } _stateful_upstream;
 
+
+static int rb_intptr_cmp(const void *a, const void *b)
+{ return a == b ? 0 : ((intptr_t)b < (intptr_t)b) ? -1 : 1; }
+
 static void
 _stateful_upstream_init(_stateful_upstream *up)
 {
@@ -811,14 +854,7 @@ _stateful_upstream_init(_stateful_upstream *up)
 	(void) getdns_eventloop_event_init(&up->event, up, NULL, NULL, NULL);
 	(void) getdns_eventloop_event_init(
 	    &up->finished_event, up, NULL, NULL, NULL);
-}
-
-static void
-_tcp_upstream_init(_stateful_upstream *up)
-{
-	assert(up);
-	_stateful_upstream_init(up);
-	up->super.vmt = &_tcp_vmt;
+	_getdns_rbtree_init(&up->netreq_by_id, rb_intptr_cmp);
 }
 
 static inline _stateful_upstream *as_stateful_up(_getdns_upstream *up)
@@ -832,8 +868,18 @@ static void _stateful_revoke(_getdns_upstream *self_up, getdns_network_req *netr
 	(void)self_up;
 	DEBUG_STUB("%s %-35s: MSG: %p\n", STUB_DEBUG_CLEANUP, __FUNC__, (void*)netreq);
 
+	if (netreq->id_registered)
+		(void) _getdns_rbtree_delete(
+		    netreq->id_registered, netreq->node.key);
 	revoke_netreq(netreq);
-	/* TODO: Removing the netreq from netreq_by_query_id */
+}
+
+static void
+_tcp_upstream_init(_stateful_upstream *up)
+{
+	assert(up);
+	_stateful_upstream_init(up);
+	up->super.vmt = &_tcp_vmt;
 }
 
 static int
@@ -924,6 +970,21 @@ tcp_connected(_stateful_upstream *upstream) {
 	return GETDNS_RETURN_GOOD;
 }
 
+static void _tcp_erred(_getdns_upstream *self_up)
+{
+	_stateful_upstream *self = as_stateful_up(self_up);
+
+	assert(self);
+
+	if (self->event.ev) {
+		GETDNS_CLEAR_EVENT(self->loop, &self->event);
+	}
+	if (self->fd >= 0) {
+		_getdns_closesocket(self->fd);
+		self->fd = -1;
+	}
+	_upstream_erred(self_up);
+}
 
 typedef struct _tls_upstream {
 	_stateful_upstream super;
@@ -1264,6 +1325,23 @@ _tls_run(_getdns_upstream *self_up, uint64_t *now_ms)
 	return send_from_waiting_queue(self_up, now_ms);
 }
 
+static void _tls_erred(_getdns_upstream *self_up)
+{
+	_tls_upstream *self = as_tls_up(self_up);
+
+	assert(self);
+
+#ifdef USE_DANESSL
+	DANESSL_cleanup(self->tls_obj);
+#endif
+	SSL_free(self->tls_obj);
+	self->tls_obj = NULL;
+	self->tls_hs_state = GETDNS_HS_NONE;
+	self->tls_auth_state = GETDNS_AUTH_NONE;
+	/* Don't cleanup tls_session, because of TLS session resumption */
+
+	_tcp_erred(self_up);
+}
 
 typedef struct _doh_upstream {
 	_tls_upstream super;
@@ -1357,10 +1435,66 @@ static void
 _doh_write_cb(void *arg)
 {
 	_doh_upstream *self = (_doh_upstream *)arg;
+	int rv;
+
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_WRITE, __FUNC__, self->super.super.fd);
 
-	if (nghttp2_session_send(self->session))
+	if ((rv = nghttp2_session_send(self->session))) {
+		UP_ERR(&self->super.super.super, "Could not send: \"%s\"",nghttp2_strerror(rv));
 		UPSTREAM_ERRED(&self->super.super.super);
+	}
+}
+
+static void
+_doh_read_cb(void *arg)
+{
+	_doh_upstream *self = (_doh_upstream *)arg;
+	int rv;
+
+	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_READ, __FUNC__, self->super.super.fd);
+
+	if ((rv = nghttp2_session_recv(self->session))) {
+		UP_ERR(&self->super.super.super, "Could not recv: \"%s\"",nghttp2_strerror(rv));
+		UPSTREAM_ERRED(&self->super.super.super);
+		return;
+	}
+	if (!self->session)
+		return;
+	if ((rv = nghttp2_session_send(self->session))) {
+		UP_ERR(&self->super.super.super, "Could not send: \"%s\"",nghttp2_strerror(rv));
+		UPSTREAM_ERRED(&self->super.super.super);
+	}
+}
+
+static ssize_t
+_doh_reschedule_on_SSL_error(_stateful_upstream *self, SSL *ssl, int err)
+{
+	switch (SSL_get_error(ssl, err)) {
+	case SSL_ERROR_WANT_READ:
+		if (self->event.ev)
+			GETDNS_CLEAR_EVENT(self->loop, &self->event);
+		GETDNS_SCHEDULE_EVENT(
+		    self->loop, self->fd, TIMEOUT_FOREVER,
+		    getdns_eventloop_event_init(&self->event, self,
+		    _doh_read_cb, NULL, NULL));
+		DEBUG_STUB("%s %-35s: FD: %d WANT READ\n", STUB_DEBUG_SCHEDULE, __FUNC__, self->fd);
+		return NGHTTP2_ERR_WOULDBLOCK;
+
+	case SSL_ERROR_WANT_WRITE:
+		if (self->event.ev)
+			GETDNS_CLEAR_EVENT(self->loop, &self->event);
+		GETDNS_SCHEDULE_EVENT(
+		    self->loop, self->fd, TIMEOUT_FOREVER,
+		    getdns_eventloop_event_init(&self->event, self,
+		    _doh_read_cb, _doh_write_cb, NULL));
+		DEBUG_STUB("%s %-35s: FD: %d WANT WRITE\n", STUB_DEBUG_SCHEDULE, __FUNC__, self->fd);
+		return NGHTTP2_ERR_WOULDBLOCK;
+
+	default:
+		UP_WARN( &self->super, "SSL error: \"%s\""
+		       , ERR_error_string(ERR_get_error(), NULL));
+		return NGHTTP2_ERR_CALLBACK_FAILURE;
+	}
 }
 
 static ssize_t
@@ -1379,37 +1513,203 @@ send_callback(nghttp2_session *session, const uint8_t *data, size_t length,
 	if (!self_doh)
 		return NGHTTP2_ERR_CALLBACK_FAILURE;
 
+	self = &self_doh->super.super;
+	if (!(ssl = self_doh->super.tls_obj))
+		return 0;
+
+	DEBUG_STUB("%s %-35s: FD: %d to write: %zu\n", STUB_DEBUG_WRITE, __FUNC__, self->fd, length);
+	ERR_clear_error();
+	written = SSL_write(ssl, data, (int)length);
+	if (written > 0) {
+		DEBUG_STUB("%s %-35s: FD: %d written: %d\n", STUB_DEBUG_WRITE, __FUNC__, self->fd, written);
+		return (ssize_t)written;
+	}
+	return _doh_reschedule_on_SSL_error(self, ssl, written);
+}
+
+static ssize_t
+recv_callback(nghttp2_session *session, uint8_t *buf, size_t length,
+    int flags,  void *user_data)
+{
+	_doh_upstream *self_doh = as_doh_up((_getdns_upstream *)user_data);
+	_stateful_upstream *self;
+	SSL *ssl;
+	int read;
+
+
+	(void)session;
+	(void)flags;
+
+	if (!self_doh)
+		return NGHTTP2_ERR_CALLBACK_FAILURE;
 
 	self = &self_doh->super.super;
-	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_WRITE, __FUNC__, self->fd);
-	ssl  = self_doh->super.tls_obj;
+	if (!(ssl  = self_doh->super.tls_obj))
+		return 0;
 
-	written = SSL_write(ssl, data, (int)length);
-	if (written > 0)
-		return (ssize_t)written;
-
-	switch (SSL_get_error(ssl, written)) {
-	case SSL_ERROR_WANT_READ:
-		if (self->event.ev)
-			GETDNS_CLEAR_EVENT(self->loop, &self->event);
-		GETDNS_SCHEDULE_EVENT(
-		    self->loop, self->fd, TIMEOUT_FOREVER,
-		    getdns_eventloop_event_init(&self->event, self,
-		    _doh_write_cb, NULL, NULL));
-		return NGHTTP2_ERR_WOULDBLOCK;
-
-	case SSL_ERROR_WANT_WRITE:
-		if (self->event.ev)
-			GETDNS_CLEAR_EVENT(self->loop, &self->event);
-		GETDNS_SCHEDULE_EVENT(
-		    self->loop, self->fd, TIMEOUT_FOREVER,
-		    getdns_eventloop_event_init(&self->event, self,
-		    NULL, _doh_write_cb, NULL));
-		return NGHTTP2_ERR_WOULDBLOCK;
-
-	default:
-		return NGHTTP2_ERR_CALLBACK_FAILURE;
+	DEBUG_STUB("%s %-35s: FD: %d to read: %zu\n", STUB_DEBUG_READ, __FUNC__, self->fd, length);
+	ERR_clear_error();
+	read = SSL_read(ssl, buf, (int)length);
+	if (read > 0) {
+		DEBUG_STUB("%s %-35s: FD: %d read: %d\n", STUB_DEBUG_READ, __FUNC__, self->fd, read);
+		return (ssize_t)read;
 	}
+	return _doh_reschedule_on_SSL_error(self, ssl, read);
+}
+
+#include <gldns/wire2str.h>
+
+static int
+on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
+    int32_t stream_id, const uint8_t *data, size_t len, void *user_data)
+{
+	_stateful_upstream *self = (_stateful_upstream *)user_data;
+	getdns_network_req *netreq;
+	intptr_t stream_id_intptr = (intptr_t)stream_id;
+	(void)session;
+
+	assert(data);
+	assert(self);
+
+	DEBUG_STUB("%s %-35s: self: %p, flags: %d, stream_id: %d, length: %zu\n", STUB_DEBUG_READ, __FUNC__, (void *)self, (int)flags, stream_id, len);
+
+	netreq = (getdns_network_req *)_getdns_rbtree_search(
+	    &self->netreq_by_id, (void *)stream_id_intptr);
+	if (! netreq) /* Netreq might have been canceled (so okay!) */
+		return 0;
+
+	/* Consistency paranoia */
+	if (netreq->id_registered != &self->netreq_by_id) {
+		if (netreq->id_registered)
+			(void) _getdns_rbtree_delete(
+			    netreq->id_registered, netreq->node.key);
+		netreq->id_registered = &self->netreq_by_id;
+	}
+	/* Length should have been previously announced (with the
+	 * "content-length:" header) and we should have a sufficient
+	 * buffer ready.
+	 */
+	if (!netreq->content_len || !netreq->response_ptr
+	||  (netreq->response_ptr - netreq->response) + len
+	   > netreq->content_len) {
+		uint64_t now_ms = 0;
+		DEBUG_STUB("ERROR in DATA CHUNK!!\n");
+		UPSTREAM_REVOKE(&self->super, netreq);
+		_fallback_resubmit_netreq(netreq, &now_ms);
+		return -1;
+	}
+	(void) memcpy(netreq->response_ptr, data, len);
+	netreq->response_ptr += len;
+	if ((netreq->response_ptr - netreq->response) ==
+	    (ssize_t)netreq->content_len) {
+		UPSTREAM_REVOKE(&self->super, netreq);
+		netreq->response_len = netreq->content_len;
+		netreq->debug_end_time = _getdns_get_time_as_uintt64();
+		_getdns_netreq_change_state(netreq, NET_REQ_FINISHED);
+		_getdns_check_dns_req_complete(netreq->owner);
+	}
+	return 0;
+}
+
+static int
+on_header_callback (nghttp2_session *session, const nghttp2_frame *frame,
+    const uint8_t *name, size_t namelen, const uint8_t *value, size_t valuelen,
+    uint8_t flags, void *user_data)
+{
+	_stateful_upstream *self = (_stateful_upstream *)user_data;
+	getdns_network_req *netreq;
+	intptr_t stream_id_intptr;
+	char digits[10];
+	char *endptr;
+	(void)session;
+	(void)flags;
+
+	if (frame->hd.type != NGHTTP2_HEADERS
+	||  frame->headers.cat != NGHTTP2_HCAT_RESPONSE)
+		return 0;
+
+       	stream_id_intptr = (intptr_t)frame->hd.stream_id;
+	netreq = (getdns_network_req *)_getdns_rbtree_search(
+	    &self->netreq_by_id, (void *)stream_id_intptr);
+	if (! netreq) /* Netreq might have been canceled (so okay!) */
+		return 0;
+
+	/* Consistency paranoia */
+	if (netreq->id_registered != &self->netreq_by_id) {
+		if (netreq->id_registered)
+			(void) _getdns_rbtree_delete(
+			    netreq->id_registered, netreq->node.key);
+		netreq->id_registered = &self->netreq_by_id;
+	}
+
+	fprintf(stderr, "incoming header: ");
+	fwrite(name, 1, namelen, stderr);
+	fprintf(stderr, ": ");
+	fwrite(value, 1, valuelen, stderr);
+	fprintf(stderr, "\n");
+	if (namelen == 7 && !strncasecmp((const char *)name, ":status", 7)) {
+		if (valuelen != 3 || strncmp((const char *)value, "200", 3)) {
+			uint64_t now_ms =0;
+
+			UP_WARN( &self->super
+			       , "Did not receive 200 status in HTTP/2 reply"
+				 ", rescheduling\n", 0);
+			UPSTREAM_REVOKE(&self->super, netreq);
+			_fallback_resubmit_netreq(netreq, &now_ms);
+		}
+		return 0;
+	} else if (namelen == 12 &&
+	    !strncasecmp((const char *)name, "content-type", 12)) {
+		if (valuelen != 29 ||
+		    strncasecmp((const char *)value,
+		    "application/dns-udpwireformat", 29)) {
+			uint64_t now_ms =0;
+
+			UP_WARN( &self->super
+			       , "Content type of HTTP/2 reply was not"
+				 "application/dns-udpwireformat"
+				 ", rescheduling\n", 0);
+			UPSTREAM_REVOKE(&self->super, netreq);
+			_fallback_resubmit_netreq(netreq, &now_ms);
+		}
+		return 0;
+	} else if (namelen != 14 ||
+	    strncasecmp((const char *)name, "content-length", 14))
+		return 0;
+
+	if (valuelen >= sizeof(digits)) {
+		uint64_t now_ms =0;
+
+		UP_WARN( &self->super
+		       , "HTTP/2 Content-length header value was too "
+			 "large\n", 0);
+		UPSTREAM_REVOKE(&self->super, netreq);
+		_fallback_resubmit_netreq(netreq, &now_ms);
+		return 0;
+	}
+	(void) memcpy(digits, value, valuelen);
+	digits[valuelen] = 0;
+	netreq->content_len = strtol(digits, &endptr, 10);
+	if (*endptr != '\0' || endptr == digits) {
+		uint64_t now_ms =0;
+
+		UP_WARN( &self->super
+		       , "HTTP/2 Content-length header had an illegal "
+			 "value: \"%s\"\n", digits);
+		UPSTREAM_REVOKE(&self->super, netreq);
+		_fallback_resubmit_netreq(netreq, &now_ms);
+		return 0;
+	}
+	if (netreq->content_len >
+	    (netreq->wire_data_sz - (netreq->response - netreq->wire_data))) {
+		UP_ERR( &self->super
+		      , "Need to allocate a new response buffer", 0);
+		assert(0);
+		return 0;
+	}
+	netreq->response_ptr = netreq->response;
+
+	return 0;
 }
 
 static int
@@ -1440,11 +1740,12 @@ _doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 		return GETDNS_RETURN_MEMORY_ERROR;
 
 	nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
+	nghttp2_session_callbacks_set_recv_callback(callbacks, recv_callback);
+	nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, on_data_chunk_recv_callback);
+	nghttp2_session_callbacks_set_on_header_callback(callbacks, on_header_callback);
 	/*
 	nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
-	nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, on_data_chunk_recv_callback);
 	nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, on_stream_close_callback);
-	nghttp2_session_callbacks_set_on_header_callback(callbacks, on_header_callback);
 	nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, on_begin_headers_callback);
 	*/
 	if (nghttp2_session_client_new(&self->session, callbacks, self)) {
@@ -1456,6 +1757,20 @@ _doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 	return _tls_run(self_up, now_ms);
 }
 
+static void _doh_erred(_getdns_upstream *self_up)
+{
+	_doh_upstream *self = as_doh_up(self_up);
+
+	assert(self);
+
+	if (self->session) {
+		nghttp2_session_del(self->session);
+		self->session = NULL;
+	}
+	/* Don't cleanup tls_ctx */
+
+	_tls_erred(self_up);
+}
 
 typedef struct _address_upstream {
 	_getdns_upstream         super;
@@ -1723,6 +2038,107 @@ typedef struct _doh_uri_upstream {
 
 static inline _doh_uri_upstream *as_doh_uri_up(_getdns_upstream *up)
 { return up && up->vmt == &_doh_uri_vmt ? (_doh_uri_upstream *)up : NULL; }
+
+
+static ssize_t
+post_data_read_callback (nghttp2_session *session, int32_t stream_id,
+    uint8_t *buf, size_t length, uint32_t *data_flags,
+    nghttp2_data_source *source, void *user_data)
+{
+	getdns_network_req *netreq = (getdns_network_req *)source->ptr;
+	_doh_upstream *self = (_doh_upstream *)user_data;
+	(void)self;
+	(void)session;
+
+	DEBUG_STUB("POST(stream_id: %d, buf: %p, length: %zu, *flags: %u, data to send: %ld)\n"
+	          , stream_id, buf, length, *data_flags, (netreq->response - netreq->query));
+
+	(void) memcpy(buf, netreq->query, netreq->response - netreq->query);
+	*data_flags |= NGHTTP2_DATA_FLAG_EOF;
+	return (ssize_t)(netreq->response - netreq->query);
+}
+
+#define MAKE_NV(NAME, VALUE, VALUELEN) { (uint8_t *)NAME, (uint8_t *)VALUE, \
+    sizeof(NAME) - 1, VALUELEN, NGHTTP2_NV_FLAG_NONE }
+
+#define MAKE_NV2(NAME, VALUE) { (uint8_t *)NAME, (uint8_t *)VALUE, \
+    sizeof(NAME) - 1, sizeof(VALUE) - 1, NGHTTP2_NV_FLAG_NONE }
+
+#define ARRLEN(x) (sizeof(x) / sizeof(x[0]))
+
+static int _doh_send(_getdns_upstream *self_up,
+    getdns_network_req *netreq, uint64_t *now_ms)
+{
+	_doh_upstream      *self;
+	_doh_uri_upstream  *parent;
+	_stateful_upstream *self_st;
+	ssize_t pkt_len;
+	char content_length[10] = "-1";
+	nghttp2_nv hdrs[6] =
+	    { MAKE_NV2(":method"       , "POST")
+	    , MAKE_NV2(":scheme"       , "https")
+	    , MAKE_NV2(":authority"    , "hdrs[2].value & hdrs[2].valuelen")
+	    , MAKE_NV2(":path"         , "hdrs[3].value & hdrs[3].valuelen")
+	    , MAKE_NV2("content-type"  , "application/dns-udpwireformat")
+	    , MAKE_NV2("content-length", content_length)
+	    };
+	nghttp2_data_provider data_prd;
+	intptr_t stream_id_intptr;
+	int rv;
+	(void)now_ms;
+
+	assert((self = as_doh_up(self_up)));
+	assert((parent = as_doh_uri_up(self_up->parent)));
+
+	if ((pkt_len = _prepare_netreq_packet_for_send(
+	    &self->super.super.super, netreq,
+	    &self->super.super.cookie, NULL)) < 0) /* TODO: pass TSIG */
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	hdrs[2].value    =  (uint8_t *)parent->super.name;
+	hdrs[2].valuelen =      strlen(parent->super.name);
+	hdrs[3].value    = (uint8_t *)(parent->path - 1);
+	hdrs[3].valuelen =      strlen(parent->path - 1);
+	hdrs[5].valuelen = snprintf( content_length, sizeof(content_length)
+	                           , "%d", (int)pkt_len );
+
+	size_t i;
+	for (i = 0; i < ARRLEN(hdrs); i++) {
+		fprintf(stderr, "header: ");
+		fwrite(hdrs[i].name, 1, hdrs[i].namelen, stderr);
+		fprintf(stderr, ": ");
+		fwrite(hdrs[i].value, 1, hdrs[i].valuelen, stderr);
+		fprintf(stderr, "\n");
+	}
+	data_prd.source.ptr = netreq;
+	data_prd.read_callback = post_data_read_callback;
+	if ((netreq->stream_id = nghttp2_submit_request(self->session, NULL,
+	    hdrs, ARRLEN(hdrs), &data_prd, NULL)) < 0)
+		return GETDNS_RETURN_IO_ERROR;
+
+	if ((rv = nghttp2_session_send(self->session) != 0)) {
+		UP_ERR(self_up, "Could not send: \"%s\"",nghttp2_strerror(rv));
+		return GETDNS_RETURN_IO_ERROR;
+	}
+	self_st = &self->super.super;
+	stream_id_intptr = (intptr_t)netreq->stream_id;
+	netreq->node.key = (void *)stream_id_intptr;
+	if (!_getdns_rbtree_insert(&self_st->netreq_by_id, &netreq->node)) {
+		/* Revoke the netreq on the tree */
+		return GETDNS_RETURN_GENERIC_ERROR;
+	}
+	netreq->id_registered = &self_st->netreq_by_id;
+	if (!self_st->event.ev) {
+		GETDNS_SCHEDULE_EVENT(
+		    self_st->loop, self_st->fd, TIMEOUT_FOREVER,
+		    getdns_eventloop_event_init(&self_st->event, self,
+		    _doh_read_cb, NULL, NULL));
+		DEBUG_STUB("%s %-35s: FD: %d schedule read\n", STUB_DEBUG_SCHEDULE, __FUNC__, self_st->fd);
+	}
+	return GETDNS_RETURN_GOOD;
+}
+
+
 
 static getdns_return_t
 _getdns_append_doh_upstream(_getdns_upstream *parent_up,
@@ -2194,43 +2610,6 @@ _getdns_append_upstream(_getdns_upstream *parent,
 	return GETDNS_RETURN_GOOD;
 }
 
-ssize_t _prepare_netreq_packet_for_send(_getdns_upstream *up,
-    getdns_network_req *netreq, _edns_cookie_st *cookie, _tsig_st *tsig)
-{
-	GLDNS_ID_SET(netreq->query, (uint16_t)arc4random());
-	if (netreq->opt) {
-		_getdns_network_req_clear_upstream_options(netreq);
-
-		if (netreq->owner->edns_cookies) {
-			/* TODO: Handle cookies */
-			(void)cookie;
-		}
-
-		if (netreq->owner->edns_client_subnet_private) {
-			const struct sockaddr *addr = UPSTREAM_GET_ADDR(up, NULL);
-
-			/* see https://tools.ietf.org/html/rfc7871#section-7.1.2
-			 * all-zeros is a request to not leak the data further:
-			 * A two byte FAMILY field is a SHOULD even when SOURCE
-			 * and SCOPE are 0.
-			 * "\x00\x02"  FAMILY: 2 for IPv6 upstreams in network byte order, or
-			 * "\x00\x01"  FAMILY: 1 for IPv4 upstreams in network byte order, then:
-			 * "\x00"  SOURCE PREFIX-LENGTH: 0
-			 * "\x00";  SCOPE PREFIX-LENGTH: 0
-			 */
-			if (_getdns_network_req_add_upstream_option(
-			    netreq, GLDNS_EDNS_CLIENT_SUBNET, 4,
-			    ( !addr || addr->sa_family != AF_INET6
-			    ? "\x00\x01\x00\x00" : "\x00\x02\x00\x00" )))
-				return -1;
-		}
-	}
-	if (!tsig || tsig->tsig_alg == GETDNS_NO_TSIG_)
-		return netreq->response - netreq->query;
-
-	return -1; /* TODO: Add tsig option */
-}
-
 static void
 _udp_revoke(_getdns_upstream *self_up, getdns_network_req *netreq)
 {
@@ -2697,7 +3076,7 @@ static _getdns_upstream_vmt  _tcp_vmt = {
 	_nop_start,
 	_nop_run,
 	_stateful_revoke,
-	_upstream_erred,
+	_tcp_erred,
 
 	_nop_equip,
 	_nop_setup_tls_ctx
@@ -2716,7 +3095,7 @@ static _getdns_upstream_vmt _tls_vmt = {
 	_tls_start,
 	_tls_run,
 	_stateful_revoke,
-	_upstream_erred,
+	_tls_erred,
 
 	_nop_equip,
 	_tls_setup_tls_ctx
@@ -2731,11 +3110,11 @@ static _getdns_upstream_vmt _doh_vmt = {
 	_doh_get_transport_name,
 
 	_tls_submit,
-	_nop_send,
+	_doh_send,
 	_tls_start,
 	_doh_run,
 	_stateful_revoke,
-	_upstream_erred,
+	_doh_erred,
 
 	_nop_equip,
 	_doh_setup_tls_ctx

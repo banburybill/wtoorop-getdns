@@ -188,10 +188,10 @@ typedef struct getdns_tcp_state {
  **/
 typedef struct getdns_network_req
 {
-	/* For storage in upstream->netreq_by_query_id */
+	/* For storage in upstream->netreq_by_id */
 	_getdns_rbnode_t  node;
-	/* The netreq_by_query_id tree in which this netreq was registered */
-	_getdns_rbtree_t *query_id_registered;
+	/* The netreq_by_id tree in which this netreq was registered */
+	_getdns_rbtree_t *id_registered;
 #ifdef HAVE_MDNS_SUPPORT
 	/*
 	 * for storage of continuous query context in hash table of cached results. 
@@ -224,7 +224,10 @@ typedef struct getdns_network_req
 	/* For stub resolving */
 	// GUPs {
 	upstream_iter           gup;
-	uint32_t                stream_id; /* For DoH */
+	                                      /* for DNS over HTTP/2:       */
+	int32_t                 stream_id;    /* - stream ID in HTTP/2      */
+	size_t                  content_len;  /* - "content-length:" header */
+	uint8_t                *response_ptr; /* - Receiving data ptr       */
 	// } GUPS
 	struct getdns_upstream *first_upstream;
 	struct getdns_upstream *upstream;

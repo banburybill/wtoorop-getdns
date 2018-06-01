@@ -126,10 +126,10 @@ network_req_cleanup(getdns_network_req *net_req)
 	if (net_req->gup.skip_bits)
 		GETDNS_FREE(net_req->owner->my_mf, net_req->gup.skip_bits);
 	// } GUPS
-	if (net_req->query_id_registered) {
+	if (net_req->id_registered) {
 		(void) _getdns_rbtree_delete(
-		    net_req->query_id_registered, net_req->node.key);
-		net_req->query_id_registered = NULL;
+		    net_req->id_registered, net_req->node.key);
+		net_req->id_registered = NULL;
 		net_req->node.key = NULL;
 	}
 	if (net_req->response && (net_req->response < net_req->wire_data ||
@@ -149,14 +149,16 @@ netreq_reset(getdns_network_req *net_req)
 	// GUPS {
 	(void) memset(&net_req->gup, 0, sizeof(net_req->gup));
 	net_req->stream_id = -1;
+	net_req->content_len = 0;
+	net_req->response_ptr = NULL;
 	// } GUPS
 	net_req->first_upstream = NULL;
 	net_req->unbound_id = -1;
 	_getdns_netreq_change_state(net_req, NET_REQ_NOT_SENT);
-	if (net_req->query_id_registered) {
-		(void) _getdns_rbtree_delete(net_req->query_id_registered,
+	if (net_req->id_registered) {
+		(void) _getdns_rbtree_delete(net_req->id_registered,
 		    (void *)(intptr_t)GLDNS_ID_WIRE(net_req->query));
-		net_req->query_id_registered = NULL;
+		net_req->id_registered = NULL;
 		net_req->node.key = NULL;
 	}
 	net_req->dnssec_status = GETDNS_DNSSEC_INDETERMINATE;
@@ -237,7 +239,7 @@ network_req_init(getdns_network_req *net_req, getdns_dns_req *owner,
 	/* A registered netreq (on a statefull transport)
 	 * Deregister on reset and cleanup.
 	 */
-	net_req->query_id_registered = NULL;
+	net_req->id_registered = NULL;
 	net_req->node.key = NULL;
 
 	if (max_query_sz == 0) {
