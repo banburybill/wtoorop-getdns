@@ -543,16 +543,23 @@ deregister_processing(_getdns_upstream *up, upstream_caps cap)
 	now_ms = 0;
 	for (i = all_trans_caps; *i; i++) {
 
+		DEBUG_STUB("cap: %x & *i: %x == %x\n", (int)cap, (int)*i, (int)(cap & *i));
+
 		if ((cap & *i) != *i)
 			continue;
 		assert(ups->processing[*i] > 0);
 		ups->processing[*i] -= 1;
+
+		DEBUG_STUB("ups->processing[*i: %x] == %d\n", (int)*i, (int)ups->processing[*i]);
+		/* TODO - show which upstreams are processing! */
 
 		/* Resubmit waiting netreqs when there are no longer upstreams
 		 * processing netreqs for this transport.
 		 */
 		while (ups->processing[*i] == 0) {
 			getdns_network_req *netreq = ups->waiting[*i].head;
+
+			DEBUG_STUB("Resubmitting: %p\n", (void *)netreq);
 
 			if (!netreq)
 				break;
@@ -1349,6 +1356,7 @@ typedef struct _doh_upstream {
 	/* settings */
 	char                     uri[4096];
 	nghttp2_session         *session;
+	unsigned int             erred: 1;
 
 	_tsig_st                 tsig;
 
@@ -1439,10 +1447,13 @@ _doh_write_cb(void *arg)
 
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_WRITE, __FUNC__, self->super.super.fd);
 
+	self->erred = 0;
 	if ((rv = nghttp2_session_send(self->session))) {
 		UP_ERR(&self->super.super.super, "Could not send: \"%s\"",nghttp2_strerror(rv));
 		UPSTREAM_ERRED(&self->super.super.super);
 	}
+	if (self->erred)
+		UPSTREAM_ERRED(&self->super.super.super);
 }
 
 static void
@@ -1453,17 +1464,22 @@ _doh_read_cb(void *arg)
 
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_READ, __FUNC__, self->super.super.fd);
 
+	self->erred = 0;
 	if ((rv = nghttp2_session_recv(self->session))) {
 		UP_ERR(&self->super.super.super, "Could not recv: \"%s\"",nghttp2_strerror(rv));
 		UPSTREAM_ERRED(&self->super.super.super);
 		return;
 	}
-	if (!self->session)
+	if (self->erred) {
+		UPSTREAM_ERRED(&self->super.super.super);
 		return;
+	}
 	if ((rv = nghttp2_session_send(self->session))) {
 		UP_ERR(&self->super.super.super, "Could not send: \"%s\"",nghttp2_strerror(rv));
 		UPSTREAM_ERRED(&self->super.super.super);
 	}
+	if (self->erred)
+		UPSTREAM_ERRED(&self->super.super.super);
 }
 
 static ssize_t
@@ -1556,8 +1572,6 @@ recv_callback(nghttp2_session *session, uint8_t *buf, size_t length,
 	}
 	return _doh_reschedule_on_SSL_error(self, ssl, read);
 }
-
-#include <gldns/wire2str.h>
 
 static int
 on_data_chunk_recv_callback(nghttp2_session *session, uint8_t flags,
@@ -1660,14 +1674,14 @@ on_header_callback (nghttp2_session *session, const nghttp2_frame *frame,
 		return 0;
 	} else if (namelen == 12 &&
 	    !strncasecmp((const char *)name, "content-type", 12)) {
-		if (valuelen != 29 ||
+		if (valuelen != 23 ||
 		    strncasecmp((const char *)value,
-		    "application/dns-udpwireformat", 29)) {
+		    "application/dns-message", 23)) {
 			uint64_t now_ms =0;
 
 			UP_WARN( &self->super
-			       , "Content type of HTTP/2 reply was not"
-				 "application/dns-udpwireformat"
+			       , "Content type of HTTP/2 reply was not "
+				 "application/dns-message "
 				 ", rescheduling\n", 0);
 			UPSTREAM_REVOKE(&self->super, netreq);
 			_fallback_resubmit_netreq(netreq, &now_ms);
@@ -1732,6 +1746,7 @@ _doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 
 	if (alpn == NULL || alpnlen != 2 || memcmp("h2", alpn, 2) != 0) {
 		UP_ERR(self_up, "h2 is not negotiaded", 0);
+		self->erred = 1;
 		return GETDNS_RETURN_IO_ERROR;
 	}
 	setsockopt(self->super.super.fd, IPPROTO_TCP, TCP_NODELAY, (char *)&val, sizeof(val));
@@ -2079,7 +2094,7 @@ static int _doh_send(_getdns_upstream *self_up,
 	    , MAKE_NV2(":scheme"       , "https")
 	    , MAKE_NV2(":authority"    , "hdrs[2].value & hdrs[2].valuelen")
 	    , MAKE_NV2(":path"         , "hdrs[3].value & hdrs[3].valuelen")
-	    , MAKE_NV2("content-type"  , "application/dns-udpwireformat")
+	    , MAKE_NV2("content-type"  , "application/dns-message")
 	    , MAKE_NV2("content-length", content_length)
 	    };
 	nghttp2_data_provider data_prd;
