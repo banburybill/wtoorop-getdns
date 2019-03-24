@@ -47,6 +47,9 @@
 #endif
 #include "getdns/getdns.h"
 #include "getdns/getdns_extra.h"
+#include "types-internal.h"
+#include "tls.h"
+#include "upstreams.h"
 #include "util-internal.h"
 #include "gldns/wire2str.h"
 #include "gldns/str2wire.h"
@@ -1677,7 +1680,7 @@ getdns_str2dict(const char *str, getdns_dict **dict)
 	if (!str || !dict)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
-	while (*str && isspace(*str))
+	while (*str && isspace((unsigned char)*str))
 		str++;
 
 	if (*str != '{') {

@@ -4,7 +4,7 @@
  */
 
 /*
- * Copyright (c) 2018, NLNet Labs, Sinodun
+ * Copyright (c) 2018-2019 NLNet Labs, Sinodun
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -37,6 +37,11 @@
 
 typedef struct getdns_network_req getdns_network_req;
 struct mem_funcs;
+struct _getdns_tls_context;
+typedef struct _getdns_tls_context _getdns_tls_context;
+struct _getdns_tls_connection;
+typedef struct _getdns_tls_connection _getdns_tls_connection;
+
 typedef uint16_t upstream_caps;
 
 #define CAP_STATELESS         0x0001
@@ -198,7 +203,7 @@ typedef const struct _getdns_upstream_vmt {
 	getdns_return_t (*equip)(_getdns_upstream *self,
 	    int af, const uint8_t *addr, _getdns_upstream **new_upstream);
 	/* For tls_upstream and the descendant doh_upstream */
-	SSL_CTX *(*setup_tls_ctx)(_getdns_upstream *self);
+	_getdns_tls_context* (*setup_tls_ctx)(_getdns_upstream *self);
 } _getdns_upstream_vmt;
 
 
@@ -264,7 +269,7 @@ void _getdns_context_set_upstreams(
 void _getdns_upstreams_cleanup(_getdns_upstreams *upstreams);
 
 getdns_return_t _getdns_upstreams2list(
-    _getdns_upstreams *upstreams, getdns_list **list_r);
+    const _getdns_upstreams *upstreams, getdns_list **list_r);
 
 /*---------------------------------------------------------------------------*/
 

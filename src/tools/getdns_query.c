@@ -62,8 +62,7 @@ static int quiet = 0;
 static int batch_mode = 0;
 static char *query_file = NULL;
 static int json = 0;
-static char *the_root = ".";
-static char *name;
+static char name[2048] = ".";
 static getdns_context *context;
 static getdns_dict *extensions;
 static getdns_dict *query_extensions_spc = NULL;
@@ -74,9 +73,11 @@ static getdns_dict *listen_dict = NULL;
 static size_t pincount = 0;
 static size_t listen_count = 0;
 static uint16_t request_type = GETDNS_RRTYPE_NS;
+static int got_rrtype = 0;
 static int timeout, edns0_size, padding_blocksize;
 static int async = 0, interactive = 0;
 static enum { GENERAL, ADDRESS, HOSTNAME, SERVICE } calltype = GENERAL;
+static int got_calltype = 0;
 static int bogus_answers = 0;
 static int check_dnssec = 0;
 #ifndef USE_WINSOCK
@@ -97,7 +98,7 @@ static int get_rrtype(const char *t)
 	if (strlen(t) > sizeof(buf) - 15)
 		return -1;
 	for (i = 14; *t && i < sizeof(buf) - 1; i++, t++)
-		buf[i] = *t == '-' ? '_' : toupper(*t);
+		buf[i] = *t == '-' ? '_' : toupper((unsigned char)*t);
 	buf[i] = '\0';
 
 	if (!getdns_str2int(buf, &rrtype))
@@ -122,7 +123,7 @@ static int get_rrclass(const char *t)
 	if (strlen(t) > sizeof(buf) - 16)
 		return -1;
 	for (i = 15; *t && i < sizeof(buf) - 1; i++, t++)
-		buf[i] = toupper(*t);
+		buf[i] = toupper((unsigned char)*t);
 	buf[i] = '\0';
 
 	if (!getdns_str2int(buf, &rrclass))
@@ -183,6 +184,7 @@ print_usage(FILE *out, const char *progname)
 	fprintf(out, "\ntsig spec: [<algorithm>:]<name>:<secret in Base64>\n");
 	fprintf(out, "\nextensions:\n");
 	fprintf(out, "\t+add_warning_for_bad_dns\n");
+	fprintf(out, "\t+dnssec\n");
 	fprintf(out, "\t+dnssec_return_status\n");
 	fprintf(out, "\t+dnssec_return_only_secure\n");
 	fprintf(out, "\t+dnssec_return_all_statuses\n");
@@ -581,6 +583,7 @@ getdns_return_t parse_args(int argc, char **argv)
 	size_t upstream_count = 0;
 	FILE *fh;
 	int int_value;
+	int got_qname = 0;
 
 	for (i = 1; i < argc; i++) {
 		arg = argv[i];
@@ -588,6 +591,7 @@ getdns_return_t parse_args(int argc, char **argv)
 		    || (*arg >= 'A' && *arg <= 'Z'))
 		    && (t = get_rrtype(arg)) >= 0) {
 			request_type = t;
+			got_rrtype = 1;
 			continue;
 
 		} else if (arg[0] == '+') {
@@ -660,7 +664,15 @@ getdns_return_t parse_args(int argc, char **argv)
 			continue;
 
 		} else if (arg[0] != '-') {
-			name = arg;
+			size_t arg_len = strlen(arg);
+
+			got_qname = 1;
+			if (arg_len > sizeof(name) - 1) {
+				fprintf(stderr, "Query name too long\n");
+				return GETDNS_RETURN_BAD_DOMAIN_NAME;
+			}
+			(void) memcpy(name, arg, arg_len);
+			name[arg_len] = 0;
 			continue;
 		}
 		for (c = arg+1; *c; c++) {
@@ -673,6 +685,7 @@ getdns_return_t parse_args(int argc, char **argv)
 				break;
 			case 'A':
 				calltype = ADDRESS;
+				got_calltype = 1;
 				break;
 			case 'b':
 				if (c[1] != 0 || ++i >= argc || !*argv[i]) {
@@ -746,9 +759,11 @@ getdns_return_t parse_args(int argc, char **argv)
 				break;
 			case 'G':
 				calltype = GENERAL;
+				got_calltype = 1;
 				break;
 			case 'H':
 				calltype = HOSTNAME;
+				got_calltype = 1;
 				break;
 			case 'h':
 				print_usage(stdout, argv[0]);
@@ -877,6 +892,7 @@ getdns_return_t parse_args(int argc, char **argv)
 				break;
 			case 'S':
 				calltype = SERVICE;
+				got_calltype = 1;
 				break;
 			case 't':
 				if (c[1] != 0 || ++i >= argc || !*argv[i]) {
@@ -1100,6 +1116,9 @@ getdns_return_t parse_args(int argc, char **argv)
 		}
 next:		;
 	}
+	if (!got_calltype && !got_rrtype && got_qname) {
+		calltype = ADDRESS;
+	}
 	if (r)
 		return r;
 	if (pubkey_pinset && upstream_count) {
@@ -1175,7 +1194,7 @@ getdns_return_t do_the_call(void)
 			r = GETDNS_RETURN_GENERIC_ERROR;
 			break;
 		}
-		if (r == GETDNS_RETURN_GOOD && !batch_mode) 
+		if (r == GETDNS_RETURN_GOOD && !batch_mode && !interactive) 
 			getdns_context_run(context);
 		if (r != GETDNS_RETURN_GOOD)
 			fprintf(stderr, "An error occurred: %d '%s'\n", (int)r,
@@ -1252,14 +1271,28 @@ static void incoming_request_handler(getdns_context *context,
     void *userarg, getdns_transaction_t request_id);
 
 
+void read_line_cb(void *userarg);
+void read_line_tiny_delay_cb(void *userarg)
+{
+	getdns_eventloop_event *read_line_ev = userarg;
+
+	loop->vmt->clear(loop, read_line_ev);
+	read_line_ev->timeout_cb = NULL;
+	read_line_ev->read_cb = read_line_cb;
+	loop->vmt->schedule(loop, fileno(fp), -1, read_line_ev);
+}
+
 void read_line_cb(void *userarg)
 {
+	static int n = 0;
 	getdns_eventloop_event *read_line_ev = userarg;
 	getdns_return_t r;
 
 	char line[1024], *token, *linev[256];
 	int linec;
 
+	assert(n == 0);
+	n += 1;
 	if (!fgets(line, 1024, fp) || !*line) {
 		if (query_file && verbosity)
 			fprintf(stdout,"End of file.");
@@ -1270,6 +1303,7 @@ void read_line_cb(void *userarg)
 		if (interactive && !query_file)
 			(void) getdns_context_set_upstream_recursive_servers(
 			    context, NULL);
+		n -= 1;
 		return;
 	}
 	if (query_file && verbosity)
@@ -1282,6 +1316,7 @@ void read_line_cb(void *userarg)
 			printf("> ");
 			fflush(stdout);
 		}
+		n -= 1;
 		return;
 	}
 	if (*token == '#') {
@@ -1291,6 +1326,7 @@ void read_line_cb(void *userarg)
 			printf("> ");
 			fflush(stdout);
 		}
+		n -= 1;
 		return;
 	}
 	do linev[linec++] = token;
@@ -1306,10 +1342,23 @@ void read_line_cb(void *userarg)
 	    (r != CONTINUE && r != CONTINUE_ERROR))
 		loop->vmt->clear(loop, read_line_ev);
 
-	else if (! query_file) {
-		printf("> ");
-		fflush(stdout);
+	else {
+#if 0
+		/* Tiny delay, to make sending queries less bursty with
+		 * -F parameter.
+		 *
+		 */
+		loop->vmt->clear(loop, read_line_ev);
+		read_line_ev->read_cb = NULL;
+		read_line_ev->timeout_cb = read_line_tiny_delay_cb;
+		loop->vmt->schedule(loop, fileno(fp), 1, read_line_ev);
+#endif
+		if (! query_file) {
+			printf("> ");
+			fflush(stdout);
+		}
 	}
+	n -= 1;
 }
 
 typedef struct dns_msg {
@@ -1738,7 +1787,6 @@ main(int argc, char **argv)
 	(void)signal(SIGPIPE, SIG_IGN);
 #endif
 
-	name = the_root;
 	if ((r = getdns_context_create(&context, 1))) {
 		fprintf(stderr, "Create context failed: %d\n", (int)r);
 		return r;

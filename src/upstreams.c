@@ -66,11 +66,11 @@ typedef unsigned short in_port_t;
 #define TIMEOUT_TLS 2500
 
 #define UP_LOG(UP, LEVEL, FMT, ...) \
-    _getdns_context_log( _up_context((UP)), GETDNS_LOG_STUB, (LEVEL) \
-                       , "%s (%s) - " FMT "\n" \
-		       , UPSTREAM_GET_NAME((UP)) \
-		       , UPSTREAM_GET_TRANSPORT_NAME((UP)) \
-		       , __VA_ARGS__ )
+    _getdns_log( &_up_context((UP))->log, GETDNS_LOG_SYS_STUB, (LEVEL) \
+		 , "%s (%s) - " FMT "\n"			 \
+		 , UPSTREAM_GET_NAME((UP))			 \
+		 , UPSTREAM_GET_TRANSPORT_NAME((UP))		 \
+		 , __VA_ARGS__ )
 
 #define UP_EMERG(UP, ...) UP_LOG((UP), GETDNS_LOG_EMERG, __VA_ARGS__)
 #define UP_ALERT(UP, ...) UP_LOG((UP), GETDNS_LOG_ALERT, __VA_ARGS__)
@@ -387,7 +387,7 @@ _getdns_upstreams_cleanup(_getdns_upstreams *upstreams)
 }
 
 getdns_return_t
-_getdns_upstreams2list(_getdns_upstreams *upstreams, getdns_list **list_r)
+_getdns_upstreams2list(const _getdns_upstreams *upstreams, getdns_list **list_r)
 {
 	getdns_list *list = NULL;
 	getdns_return_t r;
@@ -1006,8 +1006,8 @@ typedef struct _tls_upstream {
         sha256_pin_t           *tls_pubkey_pinset;
 
 	/* State */
-        SSL*                    tls_obj;
-        SSL_SESSION*            tls_session;
+        _getdns_tls_connection *tls_obj;
+        _getdns_tls_session    *tls_session;
         getdns_tls_hs_state_t   tls_hs_state;
         getdns_auth_state_t     tls_auth_state;
         unsigned                tls_fallback_ok : 1;
@@ -1053,16 +1053,18 @@ static inline _tls_upstream *as_tls_up(_getdns_upstream *up)
 
 static void _tls_cleanup(_getdns_upstream *self_up)
 {
+	struct mem_funcs *mfs;
 	_tls_upstream *self = as_tls_up(self_up);
 
 	if (!self)
 		return;
+	mfs = priv_getdns_context_mf(_up_context(self_up));
 	if (self->tls_session) {
-		SSL_SESSION_free(self->tls_session);
+		_getdns_tls_session_free(mfs, self->tls_session);
 		self->tls_session = NULL;
 	}
 	if (self->tls_obj) {
-		SSL_free(self->tls_obj);
+		_getdns_tls_connection_free(mfs, self->tls_obj);
 		self->tls_obj = NULL;
 	}
 }
@@ -1129,15 +1131,14 @@ tls_handshake_cb(void *arg)
 static int
 tls_do_handshake(_tls_upstream *upstream, uint64_t *now_ms)
 {
+	struct mem_funcs* mfs;
 	int r;
 	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
 	             __FUNC__, upstream->super.fd);
 
-	ERR_clear_error();
-	if ((r = SSL_do_handshake(upstream->tls_obj)) != 1) {
-		int want = SSL_get_error(upstream->tls_obj, r);
-		switch (want) {
-		case SSL_ERROR_WANT_WRITE:
+	if ((r = _getdns_tls_connection_do_handshake(upstream->tls_obj)) != GETDNS_RETURN_GOOD) {
+		switch (r) {
+		case GETDNS_RETURN_TLS_WANT_WRITE:
 			DEBUG_STUB("WANT HS WRITE\n");
 			GETDNS_CLEAR_EVENT(
 			    upstream->super.loop, &upstream->super.event);
@@ -1149,7 +1150,7 @@ tls_do_handshake(_tls_upstream *upstream, uint64_t *now_ms)
 			upstream->tls_hs_state = GETDNS_HS_WRITE;
 			return STUB_TCP_RETRY;
 
-		case SSL_ERROR_WANT_READ:
+		case GETDNS_RETURN_TLS_WANT_READ:
 			DEBUG_STUB("WANT HS READ\n");
 			GETDNS_CLEAR_EVENT(
 			    upstream->super.loop, &upstream->super.event);
@@ -1173,14 +1174,15 @@ tls_do_handshake(_tls_upstream *upstream, uint64_t *now_ms)
 	/* TODO: auth status string */
 	DEBUG_STUB("%s %-35s: FD:  %d Handshake succeeded with auth state %s. Session is %s.\n", 
 	    STUB_DEBUG_SETUP_TLS, __FUNC__, upstream->super.fd, "<UNKNOWN>",
-	    SSL_session_reused(upstream->tls_obj) ?"re-used":"new");
+	    _getdns_tls_connection_is_session_reused(upstream->tls_obj) ?"re-used":"new");
 
 	upstream->tls_hs_state = GETDNS_HS_DONE;
 	upstream->super.conn_state = GETDNS_CONN_OPEN;
 	upstream->super.conn_completed++;
+	mfs = priv_getdns_context_mf(_up_context(&upstream->super.super));
 	if (upstream->tls_session != NULL)
-		SSL_SESSION_free(upstream->tls_session);
-	upstream->tls_session = SSL_get1_session(upstream->tls_obj);
+		_getdns_tls_session_free(mfs, upstream->tls_session);
+	upstream->tls_session = _getdns_tls_connection_get_session(mfs, upstream->tls_obj);
 	/* Reset timeout on success*/
 
 	GETDNS_CLEAR_EVENT(upstream->super.loop, &upstream->super.event);
@@ -1194,7 +1196,7 @@ tls_connected(_tls_upstream *upstream, getdns_eventloop *loop, uint64_t *now_ms)
 {
 	int r;
 	getdns_context *context = _up_context(&upstream->super.super);
-	SSL_CTX        *tls_ctx;
+	_getdns_tls_context *tls_ctx;
 
 	DEBUG_STUB("%s %-35s: FD:  %d \n", STUB_DEBUG_SETUP_TLS, 
 	             __FUNC__, upstream->super.fd);
@@ -1229,30 +1231,14 @@ tls_connected(_tls_upstream *upstream, getdns_eventloop *loop, uint64_t *now_ms)
 		DEBUG_STUB("%s %-35s: FD:  %d tls_obj setup\n",
 		    STUB_DEBUG_SETUP_TLS, __FUNC__, upstream->super.fd);
 
-		if (!(upstream->tls_obj = SSL_new(tls_ctx))) {
-			DEBUG_STUB("SSL_new failed: %s\n", 
-					ERR_error_string(ERR_get_error(), NULL)
-					);
+		if (!(upstream->tls_obj = _getdns_tls_connection_new(&context->my_mf, tls_ctx, upstream->super.fd, &context->log))) {
 			return GETDNS_RETURN_IO_ERROR;
-		}
-
-		if (!SSL_set_fd(upstream->tls_obj, upstream->super.fd)) {
-			DEBUG_STUB("SSL_set_fd failed\n");
-			return GETDNS_RETURN_IO_ERROR;
-		}
-
-		SSL_set_connect_state(upstream->tls_obj);
-		/* (void) SSL_set_mode(upstream->tls_obj, SSL_MODE_AUTO_RETRY); */
-
-		if (upstream->tls_session != NULL) {
-			/* TODO: The whole authentication stuff (see stub.c) */
-			SSL_set_session(upstream->tls_obj, upstream->tls_session);
 		}
 	}
 	return tls_do_handshake(upstream, now_ms);
 }
 
-static SSL_CTX *_tls_setup_tls_ctx(_getdns_upstream *self_up)
+static _getdns_tls_context *_tls_setup_tls_ctx(_getdns_upstream *self_up)
 {
 	getdns_context *context;
 
@@ -1334,14 +1320,13 @@ _tls_run(_getdns_upstream *self_up, uint64_t *now_ms)
 
 static void _tls_erred(_getdns_upstream *self_up)
 {
+	struct mem_funcs *mfs;
 	_tls_upstream *self = as_tls_up(self_up);
 
 	assert(self);
 
-#ifdef USE_DANESSL
-	DANESSL_cleanup(self->tls_obj);
-#endif
-	SSL_free(self->tls_obj);
+	mfs = priv_getdns_context_mf(_up_context(self_up));
+	_getdns_tls_connection_free(mfs, self->tls_obj);
 	self->tls_obj = NULL;
 	self->tls_hs_state = GETDNS_HS_NONE;
 	self->tls_auth_state = GETDNS_AUTH_NONE;
@@ -1361,7 +1346,7 @@ typedef struct _doh_upstream {
 	_tsig_st                 tsig;
 
 	/* state */
-	SSL_CTX                 *tls_ctx;
+	_getdns_tls_context     *tls_ctx;
 } _doh_upstream;
 
 static inline _doh_upstream *as_doh_up(_getdns_upstream *up)
@@ -1381,12 +1366,12 @@ static void _doh_cleanup(_getdns_upstream *self_up)
 		self->session = NULL;
 	}
 	_tls_cleanup(self_up);
+	mfs = priv_getdns_context_mf(_up_context(self_up));
 	if (self->tls_ctx) {
-		SSL_CTX_free(self->tls_ctx);
+		_getdns_tls_context_free(mfs, self->tls_ctx);
 		self->tls_ctx = NULL;
 	}
-	if ((mfs = priv_getdns_context_mf(_up_context(self_up))))
-		GETDNS_FREE(*mfs, self_up);
+	GETDNS_FREE(*mfs, self_up);
 }
 
 static const char *
@@ -1396,25 +1381,10 @@ _doh_get_name(_getdns_upstream *self_up)
 	return self ? self->uri : NULL;
 }
 
-static int
-select_next_proto_cb(SSL * ssl, unsigned char **out,
-    unsigned char *outlen, const unsigned char *in, unsigned int inlen, void *arg)
-{
-	_stateful_upstream *up = (_stateful_upstream *)arg;
-	(void) ssl;
-
-	DEBUG_STUB("%s %-35s: FD:  %d\n", STUB_DEBUG_SETUP_TLS, 
-	             __FUNC__, up->fd);
-
-	if (nghttp2_select_next_protocol(out, outlen, in, inlen) <= 0)
-		UPSTREAM_ERRED(&up->super);
-		
-	return SSL_TLSEXT_ERR_OK;
-}
-
-static SSL_CTX *
+static _getdns_tls_context *
 _doh_setup_tls_ctx(_getdns_upstream *self_up)
 {
+	getdns_context *context = _up_context(self_up);
 	_doh_upstream *self;
 
 	if (!(self = as_doh_up(self_up)))
@@ -1424,18 +1394,13 @@ _doh_setup_tls_ctx(_getdns_upstream *self_up)
 	    STUB_DEBUG_SETUP_TLS, __FUNC__, self->super.super.fd);
 
 	if ( !self->tls_ctx &&
-	    !(self->tls_ctx = SSL_CTX_new(SSLv23_client_method())))
+	     !(self->tls_ctx = _getdns_tls_context_new(&context->my_mf, &context->log)))
 		return NULL;
 
-	SSL_CTX_set_options(self->tls_ctx,
-	    SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
-	    SSL_OP_NO_COMPRESSION |
-	    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
-	SSL_CTX_set_next_proto_select_cb(
-	    self->tls_ctx, select_next_proto_cb, self);
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(HAVE_LIBRESSL)
-	SSL_CTX_set_alpn_protos(self->tls_ctx, (const unsigned char *) "\x02h2", 3);
-#endif /* OPENSSL_VERSION_NUMBER >= 0x10002000L */
+	if ( _getdns_tls_context_set_options(self->tls_ctx, GETDNS_TLS_CONTEXT_OPT_NO_COMPRESSION | GETDNS_TLS_CONTEXT_OPT_NO_SESSION_RESUMPTION_ON_RENEGOTIATION) != GETDNS_RETURN_GOOD ||
+	     _getdns_tls_context_set_min_max_tls_version(self->tls_ctx, GETDNS_TLS1_2, 0) != GETDNS_RETURN_GOOD ||
+	     _getdns_tls_context_set_alpn_protos(self->tls_ctx, GETDNS_TLS_ALPN_HTTP2_TLS) != GETDNS_RETURN_GOOD )
+		return NULL;
 	return self->tls_ctx;
 }
 
@@ -1483,10 +1448,11 @@ _doh_read_cb(void *arg)
 }
 
 static ssize_t
-_doh_reschedule_on_SSL_error(_stateful_upstream *self, SSL *ssl, int err)
+_doh_reschedule_on_SSL_error(_stateful_upstream *self, _getdns_tls_connection* conn, int err)
 {
-	switch (SSL_get_error(ssl, err)) {
-	case SSL_ERROR_WANT_READ:
+	(void) conn;
+	switch (err) {
+	case GETDNS_RETURN_TLS_WANT_READ:
 		if (self->event.ev)
 			GETDNS_CLEAR_EVENT(self->loop, &self->event);
 		GETDNS_SCHEDULE_EVENT(
@@ -1496,7 +1462,7 @@ _doh_reschedule_on_SSL_error(_stateful_upstream *self, SSL *ssl, int err)
 		DEBUG_STUB("%s %-35s: FD: %d WANT READ\n", STUB_DEBUG_SCHEDULE, __FUNC__, self->fd);
 		return NGHTTP2_ERR_WOULDBLOCK;
 
-	case SSL_ERROR_WANT_WRITE:
+	case GETDNS_RETURN_TLS_WANT_WRITE:
 		if (self->event.ev)
 			GETDNS_CLEAR_EVENT(self->loop, &self->event);
 		GETDNS_SCHEDULE_EVENT(
@@ -1507,8 +1473,7 @@ _doh_reschedule_on_SSL_error(_stateful_upstream *self, SSL *ssl, int err)
 		return NGHTTP2_ERR_WOULDBLOCK;
 
 	default:
-		UP_WARN( &self->super, "SSL error: \"%s\""
-		       , ERR_error_string(ERR_get_error(), NULL));
+		UP_WARN( &self->super, "SSL error" , 0);
 		return NGHTTP2_ERR_CALLBACK_FAILURE;
 	}
 }
@@ -1519,9 +1484,9 @@ send_callback(nghttp2_session *session, const uint8_t *data, size_t length,
 {
 	_doh_upstream *self_doh = as_doh_up((_getdns_upstream *)user_data);
 	_stateful_upstream *self;
-	SSL *ssl;
-	int written;
-
+	_getdns_tls_connection* conn;
+	size_t written;
+	getdns_return_t res;
 
 	(void)session;
 	(void)flags;
@@ -1530,17 +1495,16 @@ send_callback(nghttp2_session *session, const uint8_t *data, size_t length,
 		return NGHTTP2_ERR_CALLBACK_FAILURE;
 
 	self = &self_doh->super.super;
-	if (!(ssl = self_doh->super.tls_obj))
+	if (!(conn = self_doh->super.tls_obj))
 		return 0;
 
 	DEBUG_STUB("%s %-35s: FD: %d to write: %zu\n", STUB_DEBUG_WRITE, __FUNC__, self->fd, length);
-	ERR_clear_error();
-	written = SSL_write(ssl, data, (int)length);
-	if (written > 0) {
+	res = _getdns_tls_connection_write(conn, data, length, &written);
+	if (res == GETDNS_RETURN_GOOD) {
 		DEBUG_STUB("%s %-35s: FD: %d written: %d\n", STUB_DEBUG_WRITE, __FUNC__, self->fd, written);
 		return (ssize_t)written;
 	}
-	return _doh_reschedule_on_SSL_error(self, ssl, written);
+	return _doh_reschedule_on_SSL_error(self, conn, res);
 }
 
 static ssize_t
@@ -1549,8 +1513,9 @@ recv_callback(nghttp2_session *session, uint8_t *buf, size_t length,
 {
 	_doh_upstream *self_doh = as_doh_up((_getdns_upstream *)user_data);
 	_stateful_upstream *self;
-	SSL *ssl;
-	int read;
+	_getdns_tls_connection* conn;
+	size_t read;
+	getdns_return_t res;
 
 
 	(void)session;
@@ -1560,17 +1525,16 @@ recv_callback(nghttp2_session *session, uint8_t *buf, size_t length,
 		return NGHTTP2_ERR_CALLBACK_FAILURE;
 
 	self = &self_doh->super.super;
-	if (!(ssl  = self_doh->super.tls_obj))
+	if (!(conn = self_doh->super.tls_obj))
 		return 0;
 
 	DEBUG_STUB("%s %-35s: FD: %d to read: %zu\n", STUB_DEBUG_READ, __FUNC__, self->fd, length);
-	ERR_clear_error();
-	read = SSL_read(ssl, buf, (int)length);
-	if (read > 0) {
+	res = _getdns_tls_connection_read(conn, buf, length, &read);
+	if (res == GETDNS_RETURN_GOOD) {
 		DEBUG_STUB("%s %-35s: FD: %d read: %d\n", STUB_DEBUG_READ, __FUNC__, self->fd, read);
 		return (ssize_t)read;
 	}
-	return _doh_reschedule_on_SSL_error(self, ssl, read);
+	return _doh_reschedule_on_SSL_error(self, conn, read);
 }
 
 static int
@@ -1730,21 +1694,14 @@ static int
 _doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 {
 	_doh_upstream *self = as_doh_up(self_up);
-	const unsigned char *alpn = NULL;
-	unsigned int alpnlen = 0;
+	_getdns_tls_alpn_proto_t proto;
 	int val = 1;
 	nghttp2_session_callbacks *callbacks;
 
 	if (!self)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
-	SSL_get0_next_proto_negotiated(self->super.tls_obj, &alpn, &alpnlen);
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
-	if (alpn == NULL)
-		SSL_get0_alpn_selected(self->super.tls_obj, &alpn, &alpnlen);
-#endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
-
-	if (alpn == NULL || alpnlen != 2 || memcmp("h2", alpn, 2) != 0) {
+	if (_getdns_tls_connection_get_alpn_proto(self->super.tls_obj, &proto) != GETDNS_RETURN_GOOD || proto != GETDNS_TLS_ALPN_HTTP2_TLS) {
 		UP_ERR(self_up, "h2 is not negotiaded", 0);
 		self->erred = 1;
 		return GETDNS_RETURN_IO_ERROR;
@@ -2713,7 +2670,7 @@ _udp_read_cb(void *userarg)
 		up->n_responses++;
 		up->back_off = 1;
 		if (up->n_responses % 100 == 1)
-			_getdns_context_log(_up_context(&up->super),
+			_getdns_log(&_up_context(&up->super)->log,
 			    GETDNS_LOG_UPSTREAM_STATS, GETDNS_LOG_INFO,
 			    "%-40s : Upstream   : %s - Resps=%6d, Timeouts"
 			    "  =%6d (logged every 100 responses)\n",
@@ -2947,7 +2904,7 @@ static getdns_return_t _nop_equip(_getdns_upstream *self_up,
 { (void)self_up; (void)new_upstream; (void)af; (void)addr;
 ; assert(0); return GETDNS_RETURN_NOT_IMPLEMENTED; }
 
-static SSL_CTX *_nop_setup_tls_ctx(_getdns_upstream *self)
+static _getdns_tls_context *_nop_setup_tls_ctx(_getdns_upstream *self)
 { (void)self; return NULL; }
 
 

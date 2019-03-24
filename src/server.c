@@ -287,8 +287,8 @@ _getdns_cancel_reply(getdns_context *context, connection *conn)
 }
 
 getdns_return_t
-getdns_reply(
-    getdns_context *context, getdns_dict *reply, getdns_transaction_t request_id)
+getdns_reply(getdns_context *context,
+    const getdns_dict *reply, getdns_transaction_t request_id)
 {
 	/* TODO: Check request_id at context->outbound_requests */
 	connection *conn = (connection *)(intptr_t)request_id;
@@ -860,9 +860,15 @@ static getdns_return_t add_listeners(listen_set *set)
 			break;
 
 		if (setsockopt(l->fd, SOL_SOCKET, SO_REUSEADDR,
-		    &enable, sizeof(int)) < 0) {
+		    &enable, sizeof(enable)) < 0) {
 			; /* Ignore */
 		}
+#if defined(HAVE_DECL_TCP_FASTOPEN) && HAVE_DECL_TCP_FASTOPEN
+		if (setsockopt(l->fd, IPPROTO_TCP, TCP_FASTOPEN,
+		    &enable, sizeof(enable)) < 0) {
+			; /* Ignore */
+		}
+#endif
 		if (bind(l->fd, (struct sockaddr *)&l->addr,
 		    l->addr_len) == -1)
 			/* IO error */

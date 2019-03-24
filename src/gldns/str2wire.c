@@ -997,6 +997,8 @@ int gldns_str2wire_rdf_buf(const char* str, uint8_t* rd, size_t* len,
 		return gldns_str2wire_hip_buf(str, rd, len);
 	case GLDNS_RDF_TYPE_INT16_DATA:
 		return gldns_str2wire_int16_data_buf(str, rd, len);
+	case GLDNS_RDF_TYPE_AMTRELAY:
+		return gldns_str2wire_amtrelay_buf(str, rd, len);
 	case GLDNS_RDF_TYPE_UNKNOWN:
 	case GLDNS_RDF_TYPE_SERVICE:
 		return GLDNS_WIREPARSE_ERR_NOT_IMPL;
@@ -1225,6 +1227,17 @@ int gldns_str2wire_b32_ext_buf(const char* str, uint8_t* rd, size_t* len)
 	return GLDNS_WIREPARSE_ERR_OK;
 }
 
+/** see if the string ends, or ends in whitespace */
+static int
+gldns_is_last_of_string(const char* str)
+{
+	if(*str == 0) return 1;
+	while(isspace((unsigned char)*str))
+		str++;
+	if(*str == 0) return 1;
+	return 0;
+}
+
 int gldns_str2wire_hex_buf(const char* str, uint8_t* rd, size_t* len)
 {
 	const char* s = str;
@@ -1234,7 +1247,7 @@ int gldns_str2wire_hex_buf(const char* str, uint8_t* rd, size_t* len)
 			s++;
 			continue;
 		}
-		if(dlen == 0 && *s == '0' && *(s+1) == 0) {
+		if(dlen == 0 && *s == '0' && gldns_is_last_of_string(s+1)) {
 			*len = 0;
 			return GLDNS_WIREPARSE_ERR_OK;
 		}
@@ -2107,3 +2120,77 @@ int gldns_str2wire_int16_data_buf(const char* str, uint8_t* rd, size_t* len)
 	*len = ((size_t)n)+2;
 	return GLDNS_WIREPARSE_ERR_OK;
 }
+
+int gldns_str2wire_amtrelay_buf(const char* str, uint8_t* rd, size_t* len)
+{
+	size_t relay_len = 0;
+	int s;
+	uint8_t relay_type;
+	char token[512];
+	gldns_buffer strbuf;
+	gldns_buffer_init_frm_data(&strbuf, (uint8_t*)str, strlen(str));
+
+	if(*len < 2)
+		return GLDNS_WIREPARSE_ERR_BUFFER_TOO_SMALL;
+	/* precedence */
+	if(gldns_bget_token(&strbuf, token, "\t\n ", sizeof(token)) <= 0)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	rd[0] = (uint8_t)atoi(token);
+	/* discovery_optional */
+	if(gldns_bget_token(&strbuf, token, "\t\n ", sizeof(token)) <= 0)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	if ((token[0] != '0' && token[0] != '1') || token[1] != 0)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+
+	rd[1] = *token == '1' ? 0x80 : 0x00;
+	/* relay_type */
+	if(gldns_bget_token(&strbuf, token, "\t\n ", sizeof(token)) <= 0)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	relay_type = (uint8_t)atoi(token);
+	if (relay_type > 0x7F)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	rd[1] |= relay_type;
+
+	if (relay_type == 0) {
+		*len = 2;
+		return GLDNS_WIREPARSE_ERR_OK;
+	}
+	/* relay */
+	if(gldns_bget_token(&strbuf, token, "\t\n ", sizeof(token)) <= 0)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	if(relay_type == 1) {
+		/* IP4 */
+		relay_len = *len - 2;
+		s = gldns_str2wire_a_buf(token, rd+2, &relay_len);
+		if(s) return RET_ERR_SHIFT(s, gldns_buffer_position(&strbuf));
+	} else if(relay_type == 2) {
+		/* IP6 */
+		relay_len = *len - 2;
+		s = gldns_str2wire_aaaa_buf(token, rd+2, &relay_len);
+		if(s) return RET_ERR_SHIFT(s, gldns_buffer_position(&strbuf));
+	} else if(relay_type == 3) {
+		/* DNAME */
+		relay_len = *len - 2;
+		s = gldns_str2wire_dname_buf(token, rd+2, &relay_len);
+		if(s) return RET_ERR_SHIFT(s, gldns_buffer_position(&strbuf));
+	} else {
+		/* unknown gateway type */
+		return RET_ERR(GLDNS_WIREPARSE_ERR_INVALID_STR,
+			gldns_buffer_position(&strbuf));
+	}
+	/* double check for size */
+	if(*len < 2 + relay_len)
+		return RET_ERR(GLDNS_WIREPARSE_ERR_BUFFER_TOO_SMALL,
+			gldns_buffer_position(&strbuf));
+
+	*len = 2 + relay_len;
+	return GLDNS_WIREPARSE_ERR_OK;
+}
+
+
