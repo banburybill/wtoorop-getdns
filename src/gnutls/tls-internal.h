@@ -65,6 +65,7 @@ typedef struct _getdns_tls_context {
 	char* ca_trust_file;
 	char* ca_trust_path;
 	const getdns_log_config* log;
+	_getdns_tls_alpn_proto_t protos;
 } _getdns_tls_context;
 
 typedef struct _getdns_tls_connection {

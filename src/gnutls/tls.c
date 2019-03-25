@@ -229,6 +229,7 @@ _getdns_tls_context* _getdns_tls_context_new(struct mem_funcs* mfs, const getdns
 	res->ca_trust_file = NULL;
 	res->ca_trust_path = NULL;
 	res->log = log;
+	res->protos = GETDNS_TLS_ALPN_NONE;
 
 	return res;
 }
@@ -258,6 +259,31 @@ getdns_return_t _getdns_tls_context_set_min_max_tls_version(_getdns_tls_context*
 		return GETDNS_RETURN_INVALID_PARAMETER;
 	ctx->min_tls = _getdns_tls_version2gnutls_version(min);
 	ctx->max_tls = _getdns_tls_version2gnutls_version(max);
+	return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t _getdns_tls_context_set_options(_getdns_tls_context* ctx, _getdns_tls_context_option_t opt)
+{
+	if (!ctx )
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t _getdns_tls_context_clear_options(_getdns_tls_context* ctx)
+{
+	if (!ctx )
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t _getdns_tls_context_get_options(_getdns_tls_context* ctx, _getdns_tls_context_option_t *opt)
+{
+	if (!ctx || !opt)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	*opt = GETDNS_TLS_CONTEXT_OPT_NO_COMPRESSION;
 	return GETDNS_RETURN_GOOD;
 }
 
@@ -319,6 +345,15 @@ getdns_return_t _getdns_tls_context_set_ca(_getdns_tls_context* ctx, const char*
 	return GETDNS_RETURN_GOOD;
 }
 
+getdns_return_t _getdns_tls_context_set_alpn_protos(_getdns_tls_context* ctx, _getdns_tls_alpn_proto_t protos)
+{
+	if (!ctx)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	ctx->protos = protos;
+	return GETDNS_RETURN_GOOD;
+}
+
 _getdns_tls_connection* _getdns_tls_connection_new(struct mem_funcs* mfs, _getdns_tls_context* ctx, int fd, const getdns_log_config* log)
 {
 	_getdns_tls_connection* res;
@@ -363,6 +398,14 @@ _getdns_tls_connection* _getdns_tls_connection_new(struct mem_funcs* mfs, _getdn
 		goto failed;
 	if (dane_state_init(&res->dane_state, DANE_F_IGNORE_DNSSEC) != DANE_E_SUCCESS)
 		goto failed;
+
+	if (ctx->protos == GETDNS_TLS_ALPN_HTTP2_TLS) {
+		gnutls_datum_t alpn;
+		alpn.data = (unsigned char*)"h2";
+		alpn.size = 2;
+		if (gnutls_alpn_set_protocols(res->tls, &alpn, 1, GNUTLS_ALPN_MANDATORY) != GNUTLS_E_SUCCESS)
+			goto failed;
+	}
 
 	gnutls_transport_set_int(res->tls, fd);
 	return res;
@@ -529,6 +572,24 @@ _getdns_tls_x509* _getdns_tls_connection_get_peer_certificate(struct mem_funcs* 
 		return NULL;
 
 	return _getdns_tls_x509_new(mfs, *cert_list);
+}
+
+getdns_return_t _getdns_tls_connection_get_alpn_proto(_getdns_tls_connection* conn, _getdns_tls_alpn_proto_t* proto)
+{
+	gnutls_datum_t gnu_proto;
+	int r;
+
+	if (!conn)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	r = gnutls_alpn_get_selected_protocol(conn->tls, &gnu_proto);
+	if (r != GNUTLS_E_SUCCESS)
+		return GETDNS_RETURN_GENERIC_ERROR;
+	if (gnu_proto.size == 2 && memcmp("h2", gnu_proto.data, 2) == 0) {
+		*proto = GETDNS_TLS_ALPN_HTTP2_TLS;
+		return GETDNS_RETURN_GOOD;
+	}
+	return GETDNS_RETURN_GENERIC_ERROR;
 }
 
 getdns_return_t _getdns_tls_connection_is_session_reused(_getdns_tls_connection* conn)
@@ -745,7 +806,7 @@ getdns_return_t _getdns_tls_connection_read(_getdns_tls_connection* conn, uint8_
 	return GETDNS_RETURN_GOOD;
 }
 
-getdns_return_t _getdns_tls_connection_write(_getdns_tls_connection* conn, uint8_t* buf, size_t to_write, size_t* written)
+getdns_return_t _getdns_tls_connection_write(_getdns_tls_connection* conn, const uint8_t* buf, size_t to_write, size_t* written)
 {
 	int swritten;
 
