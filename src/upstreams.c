@@ -1534,7 +1534,7 @@ recv_callback(nghttp2_session *session, uint8_t *buf, size_t length,
 		DEBUG_STUB("%s %-35s: FD: %d read: %d\n", STUB_DEBUG_READ, __FUNC__, self->fd, read);
 		return (ssize_t)read;
 	}
-	return _doh_reschedule_on_SSL_error(self, conn, read);
+	return _doh_reschedule_on_SSL_error(self, conn, res);
 }
 
 static int
@@ -1702,7 +1702,7 @@ _doh_run(_getdns_upstream *self_up, uint64_t *now_ms)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
 	if (_getdns_tls_connection_get_alpn_proto(self->super.tls_obj, &proto) != GETDNS_RETURN_GOOD || proto != GETDNS_TLS_ALPN_HTTP2_TLS) {
-		UP_ERR(self_up, "h2 is not negotiaded", 0);
+		UP_ERR(self_up, "h2 is not negotiated", 0);
 		self->erred = 1;
 		return GETDNS_RETURN_IO_ERROR;
 	}
