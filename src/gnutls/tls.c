@@ -102,17 +102,21 @@ static int set_connection_ciphers(_getdns_tls_connection* conn)
 	char* pri = NULL;
 	int res;
 
-	pri = getdns_priappend(conn->mfs, pri, "NONE:+COMP-ALL:+SIGN-RSA-SHA384");
+	pri = getdns_priappend(conn->mfs, pri, "NONE:+SIGN-RSA-SHA256:+SIGN-RSA-SHA384:+SIGN-RSA-SHA512:+SIGN-ECDSA-SHA256:+SIGN-ECDSA-SHA384:+SIGN-ECDSA-SHA512:SECURE128:+ECDHE-RSA:+ECDHE-ECDSA");
 
 	if (conn->cipher_suites)
 		pri = getdns_priappend(conn->mfs, pri, conn->cipher_suites);
 	else if (conn->ctx->cipher_suites)
 		pri = getdns_priappend(conn->mfs, pri, conn->ctx->cipher_suites);
+	else
+		pri = getdns_priappend(conn->mfs, pri, _getdns_tls_context_default_cipher_suites);
 
 	if (conn->cipher_list)
 		pri = getdns_priappend(conn->mfs, pri, conn->cipher_list);
 	else if (conn->ctx->cipher_list)
 		pri = getdns_priappend(conn->mfs, pri, conn->ctx->cipher_list);
+	else
+		pri = getdns_priappend(conn->mfs, pri, _getdns_tls_context_default_cipher_list);
 
 	if (conn->curve_list)
 		pri = getdns_priappend(conn->mfs, pri, conn->curve_list);
